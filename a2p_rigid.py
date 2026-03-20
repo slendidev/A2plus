@@ -64,6 +64,11 @@ SPINSTEP_DIVISOR = 12.0 #12
 WEIGHT_LINEAR_MOVE = 0.5
 WEIGHT_REFPOINT_ROTATION = 8.0
 
+# Pre-allocated zero vector to avoid repeated allocations in hot path
+# Note: Always copy before modifying since FreeCAD vectors are mutable
+_ZERO_VECTOR = Base.Vector(0, 0, 0)
+# Precomputed constant to avoid math.degrees() call in hot path
+_DEG_PER_RAD = 180.0 / math.pi
 
 
 class Rigid():
@@ -82,6 +87,7 @@ class Rigid():
         self.tempfixed = fixed
         self.moved = False
         self.placement = placement
+        self.rigidCenter = Base.Vector(placement.Base)
         # Cached state attributes
         self.initialPlacement = placement
         self.debugMode = debugMode
@@ -120,9 +126,9 @@ class Rigid():
     def countDependencies(self):
         return len(self.dependencies)
 
-    def enableDependencies(self, workList):
+    def enableDependencies(self, workList, workListSet=None):
         for dep in self.dependencies:
-            dep.enable(workList)
+            dep.enable(workList, workListSet)
 
     # The function only sets parentship for children that are distant+1 from fixed rigid
     # The function should be called in a loop with increased distance until it return False
@@ -188,10 +194,24 @@ class Rigid():
 
     def applyPlacementStep(self, pl):
         self.placement = pl.multiply(self.placement)
+        self.rigidCenter = pl.multVec(self.rigidCenter)
         self.spinCenter = pl.multVec(self.spinCenter)
         # Update dependencies
         for dep in self.dependencies:
             dep.applyPlacement(pl)
+
+    def syncToPlacement(self, placement):
+        deltaPlacement = placement.multiply(self.placement.inverse())
+        if (
+            deltaPlacement.Base.Length <= 1.0e-12 and
+            abs(deltaPlacement.Rotation.Angle) <= 1.0e-12
+            ):
+            self.moved = False
+            return
+        self.applyPlacementStep(deltaPlacement)
+        self.savedPlacement = FreeCAD.Placement(self.placement)
+        self.initialPlacement = FreeCAD.Placement(self.placement)
+        self.moved = False
 
     def clear(self):
         for d in self.dependencies:
@@ -209,19 +229,17 @@ class Rigid():
 
         axis1 = self.placement.Rotation.Axis
         axis2 = self.savedPlacement.Rotation.Axis
-        angle = math.degrees(axis2.getAngle(axis1))
+        angle = axis2.getAngle(axis1) * _DEG_PER_RAD
 
-        '''
-        if absPosMove >= solver.mySOLVER_POS_ACCURACY*1e-2 or angle >= solver.mySOLVER_SPIN_ACCURACY*1e-2:
+        posThreshold = solver.mySOLVER_POS_ACCURACY * solver.applyPlacementPosFactor
+        spinThreshold = solver.mySOLVER_SPIN_ACCURACY * solver.applyPlacementSpinFactor
+        if absPosMove >= posThreshold or angle >= spinThreshold:
             ob1 = doc.getObject(self.objectName)
             ob1.Placement = self.placement
-        '''
-        ob1 = doc.getObject(self.objectName)
-        ob1.Placement = self.placement
+        self.savedPlacement = FreeCAD.Placement(self.placement)
 
     def getRigidCenter(self):
-        _currentRigid = FreeCAD.ActiveDocument.getObject(self.objectName)
-        return _currentRigid.Shape.BoundBox.Center
+        return self.rigidCenter
 
     def calcSpinCenterDepsEnabled(self):
         newSpinCenter = Base.Vector(self.spinCenter)
@@ -249,12 +267,12 @@ class Rigid():
     def calcSpinBasicDataDepsEnabled(self):
         newSpinCenter = Base.Vector(0,0,0)
         countRefPoints = 0
-        xmin = 0
-        xmax = 0
-        ymin = 0
-        ymax = 0
-        zmin = 0
-        zmax = 0
+        xmin = float('inf')
+        xmax = float('-inf')
+        ymin = float('inf')
+        ymax = float('-inf')
+        zmin = float('inf')
+        zmax = float('-inf')
         for dep in self.dependencies:
             if dep.Enabled:
                 newSpinCenter = newSpinCenter.add(dep.refPoint)
@@ -265,9 +283,12 @@ class Rigid():
                 if dep.refPoint.y > ymax: ymax=dep.refPoint.y
                 if dep.refPoint.z < zmin: zmin=dep.refPoint.z
                 if dep.refPoint.z > zmax: zmax=dep.refPoint.z
-        vmin = Base.Vector(xmin,ymin,zmin)
-        vmax = Base.Vector(xmax,ymax,zmax)
-        self.refPointsBoundBoxSize = vmax.sub(vmin).Length
+        if countRefPoints > 0:
+            vmin = Base.Vector(xmin,ymin,zmin)
+            vmax = Base.Vector(xmax,ymax,zmax)
+            self.refPointsBoundBoxSize = vmax.sub(vmin).Length
+        else:
+            self.refPointsBoundBoxSize = 0.0
 
         if countRefPoints > 0:
             newSpinCenter.multiply(1.0/countRefPoints)
@@ -317,7 +338,10 @@ class Rigid():
         self.maxAxisError = 0.0         # SpinError is an average of all single spins
         self.maxSingleAxisError = 0.0   # avoid average, to detect unsolvable assemblies
         self.countSpinVectors = 0
-        self.moveVectorSum = Base.Vector(0,0,0)
+        # Use component-wise accumulation to avoid intermediate Vector allocations
+        moveVecSumX = 0.0
+        moveVecSumY = 0.0
+        moveVecSumZ = 0.0
         self.spin = None
 
         for dep in self.dependencies:
@@ -336,24 +360,29 @@ class Rigid():
                 a2plib.drawVector(refPoint, refPoint.add(moveVector), a2plib.RED)
             '''
             # Calculate max move error
-            if moveVector.Length > self.maxPosError: self.maxPosError = moveVector.Length
-
-            # Calculate max move error
             move_length = moveVector.Length
             if move_length > self.maxPosError:
                 self.maxPosError = move_length
 
-            # Accumulate all movements for later average calculations
-            self.moveVectorSum += moveVector
+            # Accumulate all movements using component-wise addition (avoids Vector allocation)
+            moveVecSumX += moveVector.x
+            moveVecSumY += moveVector.y
+            moveVecSumZ += moveVector.z
 
         # Calculate the average of all movements
         num_vectors = len(depMoveVectors)
         if num_vectors > 0:
-            self.moveVectorSum *= (1.0 / num_vectors)
+            scale = 1.0 / num_vectors
+            self.moveVectorSum = Base.Vector(moveVecSumX * scale, moveVecSumY * scale, moveVecSumZ * scale)
+        else:
+            self.moveVectorSum = None
 
         #compute rotation caused by refPoint-attractions
         if len(depMoveVectors_Spin) >= 2:
-            self.spin = Base.Vector(0, 0, 0)
+            # Use component-wise accumulation for spin as well
+            spinX = 0.0
+            spinY = 0.0
+            spinZ = 0.0
             tmpSpinCenter = depRefPoints_Spin[0]
 
             for i in range(1, len(depRefPoints_Spin)):
@@ -366,29 +395,44 @@ class Rigid():
                     vec1.normalize()
                     vec1.multiply(self.refPointsBoundBoxSize)
                     vec3 = vec1.add(vec2)
-                    beta = math.degrees(vec3.getAngle(vec1))
+                    beta = vec3.getAngle(vec1) * _DEG_PER_RAD
 
                     if beta > self.maxSingleAxisError:
                         self.maxSingleAxisError = beta
 
-                    axis *= (beta * WEIGHT_REFPOINT_ROTATION) / axis_length
-                    self.spin += axis
+                    scale = (beta * WEIGHT_REFPOINT_ROTATION) / axis_length
+                    spinX += axis.x * scale
+                    spinY += axis.y * scale
+                    spinZ += axis.z * scale
                     self.countSpinVectors += 1
+            
+            self.spin = Base.Vector(spinX, spinY, spinZ)
 
         #compute rotation caused by axis' of the dependencies //FIXME (align,opposed,none)
         if len(self.dependencies) > 0:
-            if self.spin is None: self.spin = Base.Vector(0,0,0)
+            if self.spin is None:
+                spinX = 0.0
+                spinY = 0.0
+                spinZ = 0.0
+            else:
+                spinX = self.spin.x
+                spinY = self.spin.y
+                spinZ = self.spin.z
 
             for dep in self.dependencies:
                 rotation = dep.getRotation(solver)
                 if rotation is None: continue       # No rotation for that dep
 
-                # Accumulate all rotations for later average calculation
-                self.spin = self.spin.add(rotation)
+                # Accumulate rotations component-wise
+                spinX += rotation.x
+                spinY += rotation.y
+                spinZ += rotation.z
                 rotationLength = rotation.Length
                 if rotationLength > self.maxSingleAxisError:
                     self.maxSingleAxisError = rotationLength
                 self.countSpinVectors += 1
+            
+            self.spin = Base.Vector(spinX, spinY, spinZ)
 
         # Calculate max rotation error
         if self.spin is not None:
@@ -405,23 +449,29 @@ class Rigid():
         if self.tempfixed or self.fixed: return
         #
         #Linear moving of a rigid
-        moveDist = Base.Vector(0,0,0)
+        moveDist = _ZERO_VECTOR
         if self.moveVectorSum is not None:
-            moveDist = Base.Vector(self.moveVectorSum)
-            moveDist.multiply(WEIGHT_LINEAR_MOVE) # stabilize computation, adjust if needed...
+            # Scale the movement vector - creates new vector
+            moveDist = Base.Vector(
+                self.moveVectorSum.x * WEIGHT_LINEAR_MOVE,
+                self.moveVectorSum.y * WEIGHT_LINEAR_MOVE,
+                self.moveVectorSum.z * WEIGHT_LINEAR_MOVE
+            )
             if self.debugMode == True:
                 a2plib.drawDebugVectorAt(self.spinCenter, moveDist, a2plib.BLUE)
         #
         #Rotate the rigid...
         center = None
         rotation = None
-        if (self.spin is not None and self.spin.Length != 0.0 and self.countSpinVectors != 0):
-            savedSpin = copy.copy(self.spin)
-            spinAngle = self.spin.Length / self.countSpinVectors
+        spinLen = self.spin.Length if self.spin is not None else 0.0
+        if spinLen != 0.0 and self.countSpinVectors != 0:
+            # Use Vector constructor instead of copy.copy (faster)
+            savedSpin = Base.Vector(self.spin) if self.debugMode else None
+            spinAngle = spinLen / self.countSpinVectors
             if spinAngle>15.0: spinAngle=15.0 # do not accept more degrees
             try:
                 spinStep = spinAngle/(SPINSTEP_DIVISOR) #it was 250.0
-                self.spin.multiply(1.0e12)
+                # normalize() already handles any magnitude, no need for multiply(1e12)
                 self.spin.normalize()
                 rotation = FreeCAD.Rotation(self.spin, spinStep)
                 center = self.spinCenter
@@ -462,8 +512,10 @@ class Rigid():
     def isFullyConstrainedByRigid(self,rig):
         if rig not in self.linkedRigids:
             return False
-        dofPOS = self.dofPOSPerLinkedRigids[rig]
-        dofROT = self.dofROTPerLinkedRigids[rig]
+        dofPOS = self.dofPOSPerLinkedRigids.get(rig)
+        dofROT = self.dofROTPerLinkedRigids.get(rig)
+        if dofPOS is None or dofROT is None:
+            return False
         if len(dofPOS) + len(dofROT) == 0:
             return True
         return False

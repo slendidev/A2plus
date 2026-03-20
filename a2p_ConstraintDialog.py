@@ -39,12 +39,19 @@ import a2p_constraints
 from a2p_translateUtils import *
 
 # from a2plib import *
-from a2p_solversystem import solveConstraints
+from a2p_solversystem import (
+    solveConstraints,
+    solveConstraintsIncremental,
+    getConstraintComponent,
+    solveConstraintsAsync,
+    getAsyncSolver,
+    )
 
 from FreeCAD import Units
 
 
 CONSTRAINT_DIALOG_STORED_POSITION = QtCore.QPoint(-1, -1)
+AUTOSOLVE_DEBOUNCE_MS = 180
 
 
 class a2p_ConstraintValueWidget(QtGui.QWidget):
@@ -78,6 +85,10 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
         self.isTopLevelWin = True  # Window management
         self.position = None       # Window position
         self.recentUnit = "mm"
+        self.cachedComponent = None
+        self.solveTimer = QtCore.QTimer(self)
+        self.solveTimer.setSingleShot(True)
+        self.solveTimer.timeout.connect(self.solveScheduled)
         self.initUI()
 
     def initUI(self):
@@ -260,6 +271,7 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
             else:
                 self.lockRotationCombo.setCurrentIndex(0)
             self.lockRotationCombo.setFixedHeight(32)
+            self.lockRotationCombo.currentIndexChanged[int].connect(self.handleLockRotationChanged)
             self.mainLayout.addWidget(self.lockRotationCombo, self.lineNo, 1)
 
             self.flipLockRotationButton = QtGui.QPushButton(self)
@@ -334,8 +346,53 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
             else:
                 self.constraintObject.lockRotation = True
 
-    def solve(self):
+    def solveScheduled(self):
+        """Called when debounce timer fires - runs async preview solve."""
         doc = FreeCAD.activeDocument()
+        if doc is None:
+            return
+        if self.constraintObject not in doc.Objects:
+            return
+        
+        self.setConstraintEditorData()
+        
+        # Use async solver for non-blocking preview
+        previousSimulationState = a2plib.SIMULATION_STATE
+        a2plib.setSimulationState(True)
+        
+        # Prepare matelist from cached component
+        matelist = self.cachedComponent
+        if matelist is None:
+            matelist = getConstraintComponent(doc, self.constraintObject)
+            self.cachedComponent = matelist
+        
+        solveCache = {'changedConstraints': [self.constraintObject]}
+        
+        def onSolveComplete(success, solver):
+            a2plib.setSimulationState(previousSimulationState)
+            if not success and self.cachedComponent is not None:
+                # Invalidate cache and let next solve try full system
+                self.cachedComponent = None
+        
+        asyncSolver = getAsyncSolver()
+        asyncSolver.solveAsync(
+            doc,
+            callback=onSolveComplete,
+            matelist=matelist,
+            fastMode=True,
+            cache=solveCache
+        )
+
+    def scheduleAutoSolve(self):
+        if not a2plib.getAutoSolveState():
+            return
+        self.solveTimer.start(AUTOSOLVE_DEBOUNCE_MS)
+
+    def solve(self, compatibilityFallback=True, useTransaction=True):
+        self.solveTimer.stop()
+        doc = FreeCAD.activeDocument()
+        if doc is None:
+            return
         if self.constraintObject not in doc.Objects:
             QtGui.QMessageBox.information(
                 QtGui.QApplication.activeWindow(),
@@ -348,9 +405,41 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
 
         self.winModified = True
         self.setConstraintEditorData()
-        doc = FreeCAD.activeDocument()
-        if doc is not None:
-            solveConstraints(doc)
+
+        if self.cachedComponent is not None:
+            objectNames = set(obj.Name for obj in doc.Objects)
+            for c in self.cachedComponent:
+                if c.Name not in objectNames:
+                    self.cachedComponent = None
+                    break
+
+        if self.cachedComponent is None:
+            self.cachedComponent = getConstraintComponent(doc, self.constraintObject)
+
+        solved = False
+        solveCache = {'changedConstraints': [self.constraintObject]}
+        if self.cachedComponent is not None:
+            solved = solveConstraints(
+                doc,
+                cache=solveCache,
+                useTransaction=useTransaction,
+                matelist=self.cachedComponent,
+                showFailMessage=False,
+                compatibilityFallback=compatibilityFallback
+                )
+
+        if not solved:
+            self.cachedComponent = None
+            solved = solveConstraintsIncremental(
+                doc,
+                self.constraintObject,
+                cache=solveCache,
+                useTransaction=useTransaction,
+                showFailMessage=False,
+                compatibilityFallback=compatibilityFallback
+                )
+
+        if not solved:
             doc.recompute()
 
     def flipLockRotation(self):
@@ -360,17 +449,17 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
         else:
             self.lockRotationCombo.setCurrentIndex(0)
 
+    def handleLockRotationChanged(self, idx=None):
+        self.winModified = True
+        self.scheduleAutoSolve()
+
     def handleOffsetChanged(self):
         self.winModified = True
-        # recalculate after every change
-        if a2plib.getAutoSolveState():
-            self.solve()
+        self.scheduleAutoSolve()
 
     def setOffsetZero(self):
         self.winModified = True
         self.offsetEdit.setValue(0.0)
-        if a2plib.getAutoSolveState():
-            self.solve()
 
     def flipOffsetSign(self):
         self.winModified = True
@@ -378,17 +467,12 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
         q = -q
         if abs(q) > 1e-7:
             self.offsetEdit.setValue(q)
-            if a2plib.getAutoSolveState():
-                self.solve()
         else:
             self.offsetEdit.setValue(0.0)
-            if a2plib.getAutoSolveState():
-                self.solve()
 
     def flipDirection2(self, idx):
         self.winModified = True
-        if a2plib.getAutoSolveState():
-            self.solve()
+        self.scheduleAutoSolve()
 
     def flipDirection(self):
         self.winModified = True
@@ -396,14 +480,10 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
             self.directionCombo.setCurrentIndex(1)
         else:
             self.directionCombo.setCurrentIndex(0)
-        if a2plib.getAutoSolveState():
-            self.solve()
 
     def handleAngleChanged(self):
         self.winModified = True
-        # recalculate after every change
-        if a2plib.getAutoSolveState():
-            self.solve()
+        self.scheduleAutoSolve()
 
     def roundAngle(self):
         # rounds angle to 5 degrees
@@ -412,8 +492,6 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
         q = round(q)
         q = q * 5
         self.angleEdit.setValue(q)
-        if a2plib.getAutoSolveState():
-            self.solve()
 
     def perpendicularAngle(self):
         if self.constraintObject.Type == "axisPlaneAngle":
@@ -424,8 +502,6 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
                 self.angleEdit.setValue(0)
             else:
                 self.angleEdit.setValue(90)
-            if a2plib.getAutoSolveState():
-                self.solve()
         else:
             # adds /subtracs 90 degrees
             # we want to go this way: 0 -> 90 -> 180 -> 90 -> 0
@@ -438,8 +514,6 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
                 self.angleEdit.setValue(q - 180)
             elif q <= 180:
                 self.angleEdit.setValue(q)
-            if a2plib.getAutoSolveState():
-                self.solve()
 
     def restoreConstraintValues(self):
         if self.savedOffset is not None:
@@ -452,6 +526,7 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
             self.constraintObject.lockRotation = self.savedLockRotation
 
     def delete(self):
+        self.solveTimer.stop()
         doc = FreeCAD.activeDocument()
         if self.constraintObject not in doc.Objects:
             QtGui.QMessageBox.information(
@@ -472,7 +547,7 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
             )
         if response == QtGui.QMessageBox.Yes:
             try:
-                removeConstraint(self.constraintObject)
+                a2plib.removeConstraint(self.constraintObject)
             except:
                 pass  # perhaps constraint already deleted by user
             a2plib.setConstraintEditorRef(None)
@@ -485,6 +560,7 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
             self.accept()
 
     def accept(self):
+        self.solveTimer.stop()
         doc = FreeCAD.activeDocument()
         if self.constraintObject not in doc.Objects:
             QtGui.QMessageBox.information(
@@ -500,6 +576,7 @@ class a2p_ConstraintValueWidget(QtGui.QWidget):
         self.Accepted.emit()
 
     def cancelOperation(self):
+        self.solveTimer.stop()
         doc = FreeCAD.activeDocument()
         if self.constraintObject not in doc.Objects:
             QtGui.QMessageBox.information(
@@ -961,7 +1038,19 @@ class a2p_ConstraintValuePanel(QtGui.QDockWidget):
             if a2plib.getAutoSolveState():
                 doc = FreeCAD.activeDocument()
                 if doc is not None:
-                    solveConstraints(doc)
+                    previousSimulationState = a2plib.SIMULATION_STATE
+                    a2plib.setSimulationState(True)
+                    try:
+                        solveConstraintsIncremental(
+                            doc,
+                            self.constraintObject,
+                            cache={'changedConstraints': [self.constraintObject]},
+                            useTransaction=False,
+                            showFailMessage=False,
+                            compatibilityFallback=False
+                            )
+                    finally:
+                        a2plib.setSimulationState(previousSimulationState)
         self.cvw.activateWindow()
 
     def storeWindowPosition(self):

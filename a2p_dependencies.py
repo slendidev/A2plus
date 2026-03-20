@@ -45,6 +45,10 @@ from a2p_libDOF import (
     )
 
 #------------------------------------------------------------------------------
+# Module-level constants to avoid repeated allocations in hot path
+_ZERO_VECTOR = Base.Vector(0, 0, 0)
+_DEG_PER_RAD = 180.0 / math.pi  # Faster than math.degrees() in hot path
+#------------------------------------------------------------------------------
 
 class Dependency():
     def __init__(self, constraint, refType, axisRotation):
@@ -110,18 +114,65 @@ class Dependency():
             )
 
     @staticmethod
-    def Create(doc, constraint, solver, rigid1, rigid2):
+    def Create(doc, constraint, solver, rigid1, rigid2, cache=None):
         c = constraint
+        if cache is None:
+            cache = {}
+
+        objectCache = cache.setdefault('objects', {})
+        posCache = cache.setdefault('pos', {})
+        axisCache = cache.setdefault('axis', {})
+        faceCache = cache.setdefault('face', {})
+        edgeCache = cache.setdefault('edge', {})
+
+        def getObj(name):
+            obj = objectCache.get(name)
+            if obj is None:
+                obj = doc.getObject(name)
+                objectCache[name] = obj
+            return obj
+
+        def getPosCached(obj, subElement):
+            key = (obj.Name, subElement)
+            pos = posCache.get(key)
+            if pos is None:
+                pos = getPos(obj, subElement)
+                posCache[key] = pos
+            return pos
+
+        def getAxisCached(obj, subElement):
+            key = (obj.Name, subElement)
+            axis = axisCache.get(key)
+            if axis is None:
+                axis = getAxis(obj, subElement)
+                axisCache[key] = axis
+            return axis
+
+        def getFaceCached(obj, subElement):
+            key = (obj.Name, subElement)
+            face = faceCache.get(key)
+            if face is None:
+                face = getObjectFaceFromName(obj, subElement)
+                faceCache[key] = face
+            return face
+
+        def getEdgeCached(obj, subElement):
+            key = (obj.Name, subElement)
+            edge = edgeCache.get(key)
+            if edge is None:
+                edge = getObjectEdgeFromName(obj, subElement)
+                edgeCache[key] = edge
+            return edge
 
         if c.Type == "sphereCenterIdent" or c.Type == "pointIdentity":
             dep1 = DependencyPointIdentity(c, "point")
             dep2 = DependencyPointIdentity(c, "point")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
 
-            vert1 = getPos(ob1, c.SubElement1)
-            vert2 = getPos(ob2, c.SubElement2)
+            vert1 = getPosCached(ob1, c.SubElement1)
+            vert2 = getPosCached(ob2, c.SubElement2)
             dep1.refPoint = vert1
             dep2.refPoint = vert2
 
@@ -129,25 +180,25 @@ class Dependency():
             dep1 = DependencyPointOnLine(c, "point")
             dep2 = DependencyPointOnLine(c, "pointAxis")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
 
-            dep1.refPoint = getPos(ob1, c.SubElement1)
-            dep2.refPoint = getPos(ob2, c.SubElement2)
+            dep1.refPoint = getPosCached(ob1, c.SubElement1)
+            dep2.refPoint = getPosCached(ob2, c.SubElement2)
 
-            axis2 = getAxis(ob2, c.SubElement2)
+            axis2 = getAxisCached(ob2, c.SubElement2)
             dep2.refAxisEnd = dep2.refPoint.add(axis2)
 
         elif c.Type == "pointOnPlane":
             dep1 = DependencyPointOnPlane(c, "point")
             dep2 = DependencyPointOnPlane(c, "plane")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
 
-            dep1.refPoint = getPos(ob1, c.SubElement1)
+            dep1.refPoint = getPosCached(ob1, c.SubElement1)
 
-            plane2 = getObjectFaceFromName(ob2, c.SubElement2)
+            plane2 = getFaceCached(ob2, c.SubElement2)
             dep2.refPoint = plane2.Faces[0].BoundBox.Center
 
             normal2 = a2plib.getPlaneNormal(plane2.Surface)
@@ -166,14 +217,14 @@ class Dependency():
             dep1 = DependencyCircularEdge(c, "pointAxis")
             dep2 = DependencyCircularEdge(c, "pointAxis")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
 
-            dep1.refPoint = getPos(ob1, c.SubElement1)
-            dep2.refPoint = getPos(ob2, c.SubElement2)
+            dep1.refPoint = getPosCached(ob1, c.SubElement1)
+            dep2.refPoint = getPosCached(ob2, c.SubElement2)
 
-            axis1 = getAxis(ob1, c.SubElement1)
-            axis2 = getAxis(ob2, c.SubElement2)
+            axis1 = getAxisCached(ob1, c.SubElement1)
+            axis2 = getAxisCached(ob2, c.SubElement2)
 
             if dep2.direction == "opposed":
                 axis2.multiply(-1.0)
@@ -190,10 +241,10 @@ class Dependency():
             dep1 = DependencyParallelPlanes(c, "pointNormal")
             dep2 = DependencyParallelPlanes(c, "pointNormal")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            plane1 = getObjectFaceFromName(ob1, c.SubElement1)
-            plane2 = getObjectFaceFromName(ob2, c.SubElement2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            plane1 = getFaceCached(ob1, c.SubElement1)
+            plane2 = getFaceCached(ob2, c.SubElement2)
             dep1.refPoint = plane1.Faces[0].BoundBox.Center
             dep2.refPoint = plane2.Faces[0].BoundBox.Center
 
@@ -209,10 +260,10 @@ class Dependency():
             dep1 = DependencyAngledPlanes(c, "pointNormal")
             dep2 = DependencyAngledPlanes(c, "pointNormal")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            plane1 = getObjectFaceFromName(ob1, c.SubElement1)
-            plane2 = getObjectFaceFromName(ob2, c.SubElement2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            plane1 = getFaceCached(ob1, c.SubElement1)
+            plane2 = getFaceCached(ob2, c.SubElement2)
             dep1.refPoint = plane1.Faces[0].BoundBox.Center
             dep2.refPoint = plane2.Faces[0].BoundBox.Center
 
@@ -225,10 +276,10 @@ class Dependency():
             dep1 = DependencyPlane(c, "pointNormal")
             dep2 = DependencyPlane(c, "pointNormal")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            plane1 = getObjectFaceFromName(ob1, c.SubElement1)
-            plane2 = getObjectFaceFromName(ob2, c.SubElement2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            plane1 = getFaceCached(ob1, c.SubElement1)
+            plane2 = getFaceCached(ob2, c.SubElement2)
             dep1.refPoint = plane1.Faces[0].BoundBox.Center
             dep2.refPoint = plane2.Faces[0].BoundBox.Center
 
@@ -249,17 +300,21 @@ class Dependency():
             dep1 = DependencyAxial(c, "pointAxis")
             dep2 = DependencyAxial(c, "pointAxis")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            dep1.refPoint = getPos(ob1,c.SubElement1)
-            dep2.refPoint = getPos(ob2,c.SubElement2)
-            axis1 = getAxis(ob1, c.SubElement1)
-            axis2 = getAxis(ob2, c.SubElement2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            dep1.refPoint = getPosCached(ob1,c.SubElement1)
+            dep2.refPoint = getPosCached(ob2,c.SubElement2)
+            axis1 = getAxisCached(ob1, c.SubElement1)
+            axis2 = getAxisCached(ob2, c.SubElement2)
             if dep2.direction == "opposed":
                 axis2.multiply(-1.0)
 
-            dep1.refPoint = dep1.adjustRefPoints(ob1,c.SubElement1,dep1.refPoint,axis1)
-            dep2.refPoint = dep2.adjustRefPoints(ob2,c.SubElement2,dep2.refPoint,axis2)
+            # Get cached faces for adjustRefPoints (None for edges)
+            face1 = getFaceCached(ob1, c.SubElement1) if c.SubElement1.startswith("Face") else None
+            face2 = getFaceCached(ob2, c.SubElement2) if c.SubElement2.startswith("Face") else None
+            
+            dep1.refPoint = dep1.adjustRefPoints(face1, dep1.refPoint, axis1)
+            dep2.refPoint = dep2.adjustRefPoints(face2, dep2.refPoint, axis2)
 
             dep1.refAxisEnd = dep1.refPoint.add(axis1)
             dep2.refAxisEnd = dep2.refPoint.add(axis2)
@@ -268,12 +323,12 @@ class Dependency():
             dep1 = DependencyAxisParallel(c, "pointAxis")
             dep2 = DependencyAxisParallel(c, "pointAxis")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            dep1.refPoint = getPos(ob1,c.SubElement1)
-            dep2.refPoint = getPos(ob2,c.SubElement2)
-            axis1 = getAxis(ob1, c.SubElement1)
-            axis2 = getAxis(ob2, c.SubElement2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            dep1.refPoint = getPosCached(ob1,c.SubElement1)
+            dep2.refPoint = getPosCached(ob2,c.SubElement2)
+            axis1 = getAxisCached(ob1, c.SubElement1)
+            axis2 = getAxisCached(ob2, c.SubElement2)
             if dep2.direction == "opposed":
                 axis2.multiply(-1.0)
 
@@ -284,11 +339,11 @@ class Dependency():
             dep1 = DependencyAxisPlaneParallel(c, "pointAxis")
             dep2 = DependencyAxisPlaneParallel(c, "pointNormal")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            axis1 = getAxis(ob1, c.SubElement1)
-            plane2 = getObjectFaceFromName(ob2, c.SubElement2)
-            dep1.refPoint = getPos(ob1,c.SubElement1)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            axis1 = getAxisCached(ob1, c.SubElement1)
+            plane2 = getFaceCached(ob2, c.SubElement2)
+            dep1.refPoint = getPosCached(ob1,c.SubElement1)
             dep2.refPoint = plane2.Faces[0].BoundBox.Center
 
             axis1Normalized = Base.Vector(axis1)
@@ -302,11 +357,11 @@ class Dependency():
             dep1 = DependencyAxisPlaneAngle(c, "pointAxis")
             dep2 = DependencyAxisPlaneAngle(c, "pointNormal")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            axis1 = getAxis(ob1, c.SubElement1)
-            plane2 = getObjectFaceFromName(ob2, c.SubElement2)
-            dep1.refPoint = getPos(ob1,c.SubElement1)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            axis1 = getAxisCached(ob1, c.SubElement1)
+            plane2 = getFaceCached(ob2, c.SubElement2)
+            dep1.refPoint = getPosCached(ob1,c.SubElement1)
             dep2.refPoint = plane2.Faces[0].BoundBox.Center
 
             axis1Normalized = Base.Vector(axis1)
@@ -322,11 +377,11 @@ class Dependency():
             dep1 = DependencyAxisPlaneNormal(c, "pointAxis")
             dep2 = DependencyAxisPlaneNormal(c, "pointNormal")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
-            axis1 = getAxis(ob1, c.SubElement1)
-            plane2 = getObjectFaceFromName(ob2, c.SubElement2)
-            dep1.refPoint = getPos(ob1,c.SubElement1)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
+            axis1 = getAxisCached(ob1, c.SubElement1)
+            plane2 = getFaceCached(ob2, c.SubElement2)
+            dep1.refPoint = getPosCached(ob1,c.SubElement1)
             dep2.refPoint = plane2.Faces[0].BoundBox.Center
 
             axis1Normalized = Base.Vector(axis1)
@@ -342,20 +397,20 @@ class Dependency():
             dep1 = DependencyCenterOfMass(c, "point")
             dep2 = DependencyCenterOfMass(c, "point")
 
-            ob1 = doc.getObject(c.Object1)
-            ob2 = doc.getObject(c.Object2)
+            ob1 = getObj(c.Object1)
+            ob2 = getObj(c.Object2)
 
             if c.SubElement1.startswith('Face'):
-                plane1 = getObjectFaceFromName(ob1, c.SubElement1)
+                plane1 = getFaceCached(ob1, c.SubElement1)
                 dep1.refPoint = plane1.Faces[0].CenterOfMass
             elif c.SubElement1.startswith('Edge'):
-                plane1 = Part.Face(Part.Wire(getObjectEdgeFromName(ob1, c.SubElement1)))
+                plane1 = Part.Face(Part.Wire(getEdgeCached(ob1, c.SubElement1)))
                 dep1.refPoint = plane1.CenterOfMass
             if c.SubElement2.startswith('Face'):
-                plane2 = getObjectFaceFromName(ob2, c.SubElement2)
+                plane2 = getFaceCached(ob2, c.SubElement2)
                 dep2.refPoint = plane2.Faces[0].CenterOfMass
             elif c.SubElement2.startswith('Edge'):
-                plane2 = Part.Face(Part.Wire(getObjectEdgeFromName(ob2, c.SubElement2)))
+                plane2 = Part.Face(Part.Wire(getEdgeCached(ob2, c.SubElement2)))
                 dep2.refPoint = plane2.CenterOfMass
 
             normal1 = a2plib.getPlaneNormal(plane1.Surface)
@@ -394,8 +449,11 @@ class Dependency():
         if self.refAxisEnd is not None:
             self.refAxisEnd = placement.multVec(self.refAxisEnd)
 
-    def enable(self, workList):
-        if self.dependedRigid not in workList:
+    def enable(self, workList, workListSet=None):
+        if workListSet is None:
+            if self.dependedRigid not in workList:
+                return
+        elif self.dependedRigid not in workListSet:
             return
         self.Enabled = True
         self.foreignDependency.Enabled = True
@@ -437,10 +495,13 @@ class Dependency():
             #axis = foreignAxis.cross(rigAxis)
             axis = rigAxis.cross(foreignAxis)
             try:
-                axis.multiply(1.0e6)
-                axis.normalize()
-                angle = foreignAxis.getAngle(rigAxis)
-                axis.multiply(math.degrees(angle))
+                # Get angle in degrees and scale axis directly (avoid separate normalize + multiply)
+                angle_deg = foreignAxis.getAngle(rigAxis) * _DEG_PER_RAD
+                axisLen = axis.Length
+                if axisLen > 1e-12:
+                    axis.multiply(angle_deg / axisLen)
+                else:
+                    axis = None
             except:
                 axis = None
 
@@ -448,19 +509,23 @@ class Dependency():
             rigAxis = self.refAxisEnd.sub(self.refPoint)
             foreignDep = self.foreignDependency
             foreignAxis = foreignDep.refAxisEnd.sub(foreignDep.refPoint)
-            angle1 = abs(foreignAxis.getAngle(rigAxis))
-            angle2 = math.pi-angle1
+            angle1 = foreignAxis.getAngle(rigAxis)
+            angle2 = math.pi - angle1
             #
-            if angle1<=angle2:
+            if angle1 <= angle2:
                 axis = rigAxis.cross(foreignAxis)
             else:
                 foreignAxis.multiply(-1.0)
                 axis = rigAxis.cross(foreignAxis)
+                angle1 = foreignAxis.getAngle(rigAxis)  # Recompute after flip
             try:
-                axis.multiply(1.0e6)
-                axis.normalize()
-                angle = foreignAxis.getAngle(rigAxis)
-                axis.multiply(math.degrees(angle))
+                # Scale axis directly: normalize + multiply(angle_deg) = multiply(angle_deg / length)
+                angle_deg = angle1 * _DEG_PER_RAD
+                axisLen = axis.Length
+                if axisLen > 1e-12:
+                    axis.multiply(angle_deg / axisLen)
+                else:
+                    axis = None
             except:
                 axis = None
 
@@ -625,7 +690,7 @@ class DependencyParallelPlanes(Dependency):
     def getMovement(self):
         if not self.Enabled: return None, None
 
-        return self.refPoint, Base.Vector(0,0,0)
+        return self.refPoint, _ZERO_VECTOR
 
     def calcDOF(self, _dofPos, _dofRot, _pointconstraints=[]):
         #PlanesParallelConstraint:
@@ -643,7 +708,7 @@ class DependencyAngledPlanes(Dependency):
     def getMovement(self):
         if not self.Enabled: return None, None
 
-        return self.refPoint, Base.Vector(0,0,0)
+        return self.refPoint, _ZERO_VECTOR
 
     def getRotation(self, solver):
         if not self.Enabled: return None
@@ -653,12 +718,16 @@ class DependencyAngledPlanes(Dependency):
         rigAxis = self.refAxisEnd.sub(self.refPoint)
         foreignDep = self.foreignDependency
         foreignAxis = foreignDep.refAxisEnd.sub(foreignDep.refPoint)
-        recentAngle = math.degrees(foreignAxis.getAngle(rigAxis))
+        recentAngle = foreignAxis.getAngle(rigAxis) * _DEG_PER_RAD
         deltaAngle = abs(self.angle.Value) - recentAngle
         try:
             axis = rigAxis.cross(foreignAxis)
-            axis.normalize()
-            axis.multiply(-deltaAngle)
+            # Combine normalize + multiply: multiply(scale / length)
+            axisLen = axis.Length
+            if axisLen > 1e-12:
+                axis.multiply(-deltaAngle / axisLen)
+            else:
+                raise ValueError("Zero length axis")
         except:
             # axis = Vector(0,0,0) and cannot be normalized...
             # return a random axis with very small angle...
@@ -732,11 +801,20 @@ class DependencyAxial(Dependency):
         moveVector = vec1.sub(parallelToAxisVec)
         return self.refPoint.add(parallelToAxisVec), moveVector
 
-    def adjustRefPoints(self,obj,sub,refPoint,axis):
-        if sub.startswith("Edge"): return refPoint
-        face = getObjectFaceFromName(obj,sub)
+    def adjustRefPoints(self, face, refPoint, axis):
+        """
+        Adjust reference points for axial constraints.
+        Args:
+            face: Face object (or None if SubElement is an Edge)
+            refPoint: Current reference point
+            axis: Axis vector
+        Returns:
+            Adjusted reference point
+        """
+        if face is None:
+            return refPoint
         bbCenter = face.BoundBox.Center
-        if bbCenter.distanceToLine(refPoint,axis) < 1.0e-12:
+        if bbCenter.distanceToLine(refPoint, axis) < 1.0e-12:
             return bbCenter
         v1 = bbCenter.sub(refPoint)
         v2 = Base.Vector(axis)
@@ -785,7 +863,7 @@ class DependencyAxisPlaneParallel(Dependency):
 
     def getMovement(self):
         if not self.Enabled: return None, None
-        return self.refPoint, Base.Vector(0,0,0)
+        return self.refPoint, _ZERO_VECTOR
 
     def getRotation(self, solver):
         if not self.Enabled: return None
@@ -795,12 +873,16 @@ class DependencyAxisPlaneParallel(Dependency):
         rigAxis = self.refAxisEnd.sub(self.refPoint)
         foreignDep = self.foreignDependency
         foreignAxis = foreignDep.refAxisEnd.sub(foreignDep.refPoint)
-        recentAngle = math.degrees(foreignAxis.getAngle(rigAxis))
+        recentAngle = foreignAxis.getAngle(rigAxis) * _DEG_PER_RAD
         deltaAngle = 90.0 - recentAngle #axis of linearEdge and plane normal have to be rectangular
         try:
             axis = rigAxis.cross(foreignAxis)
-            axis.normalize()
-            axis.multiply(-deltaAngle)
+            # Combine normalize + multiply: multiply(scale / length)
+            axisLen = axis.Length
+            if axisLen > 1e-12:
+                axis.multiply(-deltaAngle / axisLen)
+            else:
+                raise ValueError("Zero length axis")
         except:
             #axis = Vector(0,0,0) and cannot be normalized...
             #axis and normal are parallel, do small random rotation
@@ -825,7 +907,7 @@ class DependencyAxisPlaneAngle(Dependency):
 
     def getMovement(self):
         if not self.Enabled: return None, None
-        return self.refPoint, Base.Vector(0,0,0)
+        return self.refPoint, _ZERO_VECTOR
 
     def getRotation(self, solver):
         if not self.Enabled: return None
@@ -835,12 +917,16 @@ class DependencyAxisPlaneAngle(Dependency):
         rigAxis = self.refAxisEnd.sub(self.refPoint)
         foreignDep = self.foreignDependency
         foreignAxis = foreignDep.refAxisEnd.sub(foreignDep.refPoint)
-        recentAngle = math.degrees(foreignAxis.getAngle(rigAxis))
+        recentAngle = foreignAxis.getAngle(rigAxis) * _DEG_PER_RAD
         deltaAngle = abs(self.angle.Value) + 90.0 - recentAngle
         try:
             axis = rigAxis.cross(foreignAxis)
-            axis.normalize()
-            axis.multiply(-deltaAngle)
+            # Combine normalize + multiply: multiply(scale / length)
+            axisLen = axis.Length
+            if axisLen > 1e-12:
+                axis.multiply(-deltaAngle / axisLen)
+            else:
+                raise ValueError("Zero length axis")
         except:
             #axis = Vector(0,0,0) and cannot be normalized...
             #axis and normal are parallel, do small random rotation
@@ -865,7 +951,7 @@ class DependencyAxisPlaneNormal(Dependency):
 
     def getMovement(self):
         if not self.Enabled: return None, None
-        return self.refPoint, Base.Vector(0,0,0)
+        return self.refPoint, _ZERO_VECTOR
 
     def calcDOF(self, _dofPos, _dofRot, _pointconstraints=[]):
         #AngleBetweenPlanesConstraint

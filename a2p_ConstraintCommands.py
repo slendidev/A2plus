@@ -55,7 +55,7 @@ class a2p_PointIdentityConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.PointIdentityConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -81,7 +81,7 @@ class a2p_PointOnLineConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.PointOnLineConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -107,7 +107,7 @@ class a2p_PointOnPlaneConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.PointOnPlaneConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -133,7 +133,7 @@ class a2p_SphericalSurfaceConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.SphericalConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -159,7 +159,7 @@ class a2p_CircularEdgeConnectionCommand:
 
     def IsActive(self):
         return a2p_constraints.CircularEdgeConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -185,7 +185,7 @@ class a2p_AxialConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.AxialConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -211,7 +211,7 @@ class a2p_AxisParallelConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.AxisParallelConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -237,7 +237,7 @@ class a2p_AxisPlaneParallelCommand:
 
     def IsActive(self):
         return a2p_constraints.AxisPlaneParallelConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -263,7 +263,7 @@ class a2p_AxisPlaneAngleCommand:
 
     def IsActive(self):
         return a2p_constraints.AxisPlaneAngleConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -289,7 +289,7 @@ class a2p_AxisPlaneNormalCommand:
 
     def IsActive(self):
         return a2p_constraints.AxisPlaneNormalConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -315,7 +315,7 @@ class a2p_PlanesParallelConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.PlanesParallelConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -341,7 +341,7 @@ class a2p_PlaneCoincidentConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.PlaneConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -367,7 +367,7 @@ class a2p_AngledPlanesConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.AngledPlanesConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):
@@ -393,7 +393,7 @@ class a2p_CenterOfMassConstraintCommand:
 
     def IsActive(self):
         return a2p_constraints.CenterOfMassConstraint.isValidSelection(
-            FreeCADGui.Selection.getSelectionEx()
+            getSelectionExCached()
             )
 
     def GetResources(self):

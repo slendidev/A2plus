@@ -22,9 +22,12 @@
 #***************************************************************************
 
 import os
+import time
 import FreeCAD, FreeCADGui
-from PySide import QtGui
+from FreeCAD import Base
+from PySide import QtGui, QtCore
 #from a2p_translateUtils import *
+import threading
 import a2plib
 from a2plib import (
     path_a2p,
@@ -56,6 +59,179 @@ SOLVER_SPIN_ACCURACY = 1.0e-1 # gets to smaller values during solving
 SOLVER_STEPS_CONVERGENCY_CHECK = 2000 #200
 SOLVER_CONVERGENCY_FACTOR = 0.99
 SOLVER_CONVERGENCY_ERROR_INIT_VALUE = 1.0e+20
+FAST_SOLVER_MAXSTEPS = 12000
+FAST_SOLVER_STEPS_CONVERGENCY_CHECK = 500
+FAST_SOLVER_CONVERGENCY_FACTOR = 0.999
+
+#------------------------------------------------------------------------------
+# Threaded Solver Infrastructure
+#------------------------------------------------------------------------------
+
+class _SolverSignalHelper(QtCore.QObject):
+    """
+    Helper QObject that lives on main thread to receive cross-thread signals.
+    Must be created on main thread.
+    """
+    solveFinished = QtCore.Signal(bool, object, object, object)  # success, solver, doc, callback
+    
+    def __init__(self, parent=None):
+        super(_SolverSignalHelper, self).__init__(parent)
+        self.solveFinished.connect(self._handleFinished, QtCore.Qt.QueuedConnection)
+        # Ensure we're on the main thread
+        if QtGui.QApplication.instance() is not None:
+            self.moveToThread(QtGui.QApplication.instance().thread())
+    
+    def _handleFinished(self, success, solver, doc, callback):
+        """Called on main thread when solver completes."""
+        if doc is not None and success:
+            # Apply placements on main thread
+            solver.solutionToParts(doc)
+            solver.status = "solved"
+            touchedObjects = [doc.getObject(name) for name in solver.touchedObjectNames]
+            a2plib.unTouchA2pObjects(touchedObjects)
+        
+        if callback:
+            try:
+                callback(success, solver)
+            except Exception as e:
+                Msg("Async solver callback error: {}\n".format(str(e)))
+
+
+# Global signal helper - created lazily on first use (must be on main thread)
+_SOLVER_SIGNAL_HELPER = None
+
+def _getSolverSignalHelper():
+    global _SOLVER_SIGNAL_HELPER
+    if _SOLVER_SIGNAL_HELPER is None:
+        _SOLVER_SIGNAL_HELPER = _SolverSignalHelper()
+    return _SOLVER_SIGNAL_HELPER
+
+
+class AsyncSolver(object):
+    """
+    Manages async solving using Python threading.
+    Uses Qt signals with QueuedConnection to safely call back to main thread.
+    
+    Usage:
+        asyncSolver = AsyncSolver()
+        asyncSolver.solveAsync(doc, callback)
+    """
+    def __init__(self):
+        self._thread = None
+        self._cancelled = False
+        self._lock = threading.Lock()
+        self._callback = None
+        self._doc = None
+        self._solver = None
+    
+    def isBusy(self):
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+    
+    def cancel(self):
+        with self._lock:
+            self._cancelled = True
+    
+    def _isCancelled(self):
+        with self._lock:
+            return self._cancelled
+    
+    def solveAsync(self, doc, callback=None, matelist=None, fastMode=True, 
+                   checkFaultyConstraints=False, cache=None):
+        """
+        Start an async solve. Returns immediately.
+        callback(success, solver) is called on main thread when done.
+        """
+        # If busy, cancel and wait briefly
+        if self.isBusy():
+            self.cancel()
+            if self._thread is not None:
+                self._thread.join(timeout=0.5)
+        
+        with self._lock:
+            self._cancelled = False
+        
+        self._doc = doc
+        self._callback = callback
+        
+        # Get or create session and solver (must happen on main thread - accesses doc)
+        changedConstraints, skipConstraintRefresh = _sessionOptionsFromCache(cache)
+        session = _getSolverSession(doc)
+        
+        # Use the session's getSolver which handles caching and refresh
+        solver, isSynced = session.getSolver(
+            matelist,
+            fastMode,
+            checkFaultyConstraints,
+            changedConstraints=changedConstraints,
+            skipConstraintRefresh=skipConstraintRefresh
+        )
+        
+        if solver.status == "loadingDependencyError":
+            if callback:
+                callback(False, solver)
+            return
+        
+        self._solver = solver
+        solverControlData = solver._prepareAccuracyLoop()
+        
+        # Get signal helper NOW on main thread (not in worker thread)
+        signalHelper = _getSolverSignalHelper()
+        
+        # Start worker thread, passing the helper reference
+        self._thread = threading.Thread(
+            target=self._workerRun,
+            args=(solver, doc, solverControlData, callback, signalHelper),
+            daemon=True
+        )
+        self._thread.start()
+    
+    def _workerRun(self, solver, doc, solverControlData, callback, signalHelper):
+        """Run in background thread - only does computation, no Qt calls."""
+        success = False
+        try:
+            # Inject cancellation check into solver
+            solver._asyncCancelCheck = self._isCancelled
+            solver._asyncProgressCallback = None  # No progress for now (would need queue)
+            
+            success = solver._runAccuracyLoop(doc, solverControlData)
+            
+            if self._isCancelled():
+                success = False
+        except Exception as e:
+            Msg("Solver thread error: {}\n".format(str(e)))
+            success = False
+        finally:
+            solver._asyncCancelCheck = None
+            solver._asyncProgressCallback = None
+        
+        # Clear thread reference
+        with self._lock:
+            self._thread = None
+        
+        # Marshal callback to main thread using Qt signal with QueuedConnection
+        # signalHelper was created on main thread, so emit is thread-safe
+        signalHelper.solveFinished.emit(success, solver, doc, callback)
+
+
+# Global async solver instance for simple usage
+_ASYNC_SOLVER = None
+
+def getAsyncSolver():
+    global _ASYNC_SOLVER
+    if _ASYNC_SOLVER is None:
+        _ASYNC_SOLVER = AsyncSolver()
+    return _ASYNC_SOLVER
+
+def solveConstraintsAsync(doc, callback=None, cache=None, matelist=None, fastMode=True):
+    """
+    Non-blocking solve. Returns immediately.
+    callback(success, solver) called on main thread when done.
+    """
+    asyncSolver = getAsyncSolver()
+    asyncSolver.solveAsync(doc, callback, matelist, fastMode, 
+                           checkFaultyConstraints=False, cache=cache)
+    return asyncSolver
 
 #------------------------------------------------------------------------------
 
@@ -72,6 +248,7 @@ class SolverSystem():
         self.rigids = []        # list of rigid bodies
         self.constraints = []
         self.objectNames = []
+        self.rigidByName = {}
         self.mySOLVER_SPIN_ACCURACY = SOLVER_SPIN_ACCURACY
         self.mySOLVER_POS_ACCURACY = SOLVER_POS_ACCURACY
         self.lastPositionError = SOLVER_CONVERGENCY_ERROR_INIT_VALUE
@@ -87,6 +264,18 @@ class SolverSystem():
         self.unmovedParts = []
         # Initialize cache dictionary to store positions of rigids and their solutions
         self.rigid_positions_cache = {}
+        self.fastMode = False
+        self.applyPlacementPosFactor = 1.0e-2
+        self.applyPlacementSpinFactor = 1.0e-2
+        self.maxSteps = SOLVER_MAXSTEPS
+        self.convergencyCheckSteps = SOLVER_STEPS_CONVERGENCY_CHECK
+        self.convergencyFactor = SOLVER_CONVERGENCY_FACTOR
+        self.touchedObjectNames = set()
+        self.timingLoadMs = 0.0
+        self.timingChainMs = 0.0
+        # Async solver hooks (set by SolverWorker when running in thread)
+        self._asyncCancelCheck = None      # callable() -> bool, returns True to cancel
+        self._asyncProgressCallback = None # callable(stepCount, maxPosError)
 
     def clear(self):
         for r in self.rigids:
@@ -95,7 +284,26 @@ class SolverSystem():
         self.rigids = []
         self.constraints = []
         self.objectNames = []
+        self.rigidByName = {}
         self.partialSolverCurrentStage = PARTIAL_SOLVE_STAGE1
+        self.touchedObjectNames = set()
+        self.timingLoadMs = 0.0
+        self.timingChainMs = 0.0
+
+    def configureMode(self, fastMode):
+        self.fastMode = fastMode
+        if fastMode:
+            self.applyPlacementPosFactor = 3.0e-2
+            self.applyPlacementSpinFactor = 3.0e-2
+            self.maxSteps = FAST_SOLVER_MAXSTEPS
+            self.convergencyCheckSteps = FAST_SOLVER_STEPS_CONVERGENCY_CHECK
+            self.convergencyFactor = FAST_SOLVER_CONVERGENCY_FACTOR
+        else:
+            self.applyPlacementPosFactor = 1.0e-2
+            self.applyPlacementSpinFactor = 1.0e-2
+            self.maxSteps = SOLVER_MAXSTEPS
+            self.convergencyCheckSteps = SOLVER_STEPS_CONVERGENCY_CHECK
+            self.convergencyFactor = SOLVER_CONVERGENCY_FACTOR
 
     def getSolverControlData(self):
         if a2plib.SIMULATION_STATE:
@@ -118,9 +326,7 @@ class SolverSystem():
 
     def getRigid(self,objectName):
         """Get a Rigid by objectName."""
-        rigs = [r for r in self.rigids if r.objectName == objectName]
-        if len(rigs) > 0: return rigs[0]
-        return None
+        return self.rigidByName.get(objectName)
 
     def removeFaultyConstraints(self, doc):
         """
@@ -144,12 +350,13 @@ class SolverSystem():
                 FreeCAD.Console.PrintMessage(translate("A2plus", "Remove faulty constraint '{}'").format(fc.Label) + "\n")
                 doc.removeObject(fc.Name)
 
-    def loadSystem(self,doc, matelist=None):
+    def loadSystem(self, doc, matelist=None, checkFaultyConstraints=True, buildDOFInfo=False, geometryCache=None):
         self.clear()
         self.doc = doc
         self.status = "loading"
 
-        self.removeFaultyConstraints(doc)
+        if checkFaultyConstraints:
+            self.removeFaultyConstraints(doc)
 
         self.convergencyCounter = 0
         self.lastPositionError = SOLVER_CONVERGENCY_ERROR_INIT_VALUE
@@ -166,18 +373,20 @@ class SolverSystem():
             constraints = [ obj for obj in doc.Objects if 'ConstraintInfo' in obj.Content]
         # check for Suppressed mates here and transfer mates to self.constraints
         for obj in constraints:
-            if hasattr(obj,'Suppressed'):
-                #if the mate is suppressed do not add it
-                if obj.Suppressed == False:
-                    self.constraints.append(obj)
+            if hasattr(obj, 'Suppressed') and obj.Suppressed:
+                continue
+            self.constraints.append(obj)
         #
         # Extract all the objectnames which are affected by constraints..
         self.objectNames = []
+        objectNamesSet = set()
         for c in self.constraints:
             for attr in ['Object1','Object2']:
                 objectName = getattr(c, attr, None)
-                if objectName is not None and not objectName in self.objectNames:
-                    self.objectNames.append( objectName )
+                if objectName is not None and objectName not in objectNamesSet:
+                    objectNamesSet.add(objectName)
+                    self.objectNames.append(objectName)
+        self.touchedObjectNames = set(self.objectNames)
         #
         # create a Rigid() dataStructure for each of these objectnames...
         for o in self.objectNames:
@@ -197,11 +406,18 @@ class SolverSystem():
                 ob1.Placement,
                 debugMode
                 )
-            rig.spinCenter = ob1.Shape.BoundBox.Center
+            if buildDOFInfo:
+                rig.rigidCenter = ob1.Shape.BoundBox.Center
+            else:
+                rig.rigidCenter = Base.Vector(ob1.Placement.Base)
+            rig.spinCenter = Base.Vector(rig.rigidCenter)
             self.rigids.append(rig)
+            self.rigidByName[o] = rig
         #
         # link constraints to rigids using dependencies
         deleteList = [] # a list to collect broken constraints
+        # Use provided geometry cache or create a fresh one
+        depCache = geometryCache if geometryCache is not None else {}
         for c in self.constraints:
             rigid1 = self.getRigid(c.Object1)
             rigid2 = self.getRigid(c.Object2)
@@ -211,7 +427,7 @@ class SolverSystem():
             if rigid1 is not None and not rigid1 in rigid2.linkedRigids: rigid2.linkedRigids.append(rigid1);
 
             try:
-                Dependency.Create(doc, c, self, rigid1, rigid2)
+                Dependency.Create(doc, c, self, rigid1, rigid2, depCache)
             except:
                 self.status = "loadingDependencyError"
                 deleteList.append(c)
@@ -244,8 +460,23 @@ class SolverSystem():
             rig.calcSpinCenter()
             rig.calcRefPointsBoundBoxSize()
 
-        self.retrieveDOFInfo() # function only once used here at this place in whole program
+        if buildDOFInfo:
+            self.retrieveDOFInfo() # function only once used here at this place in whole program
         self.status = "loaded"
+
+    def syncFromDocument(self, doc):
+        if doc is None:
+            return False
+        self.doc = doc
+        for rig in self.rigids:
+            ob = doc.getObject(rig.objectName)
+            if ob is None:
+                return False
+            rig.fixed = getattr(ob, 'fixedPosition', False)
+            rig.debugMode = getattr(ob, 'debugmode', False)
+            rig.syncToPlacement(ob.Placement)
+        self.touchedObjectNames = set(self.objectNames)
+        return True
 
     def DOF_info_to_console(self):
         doc = FreeCAD.activeDocument()
@@ -259,7 +490,7 @@ class SolverSystem():
             doc.removeObject("dofLabels")
             dofGroup=doc.addObject("App::DocumentObjectGroup", "dofLabels")
 
-        self.loadSystem( doc )
+        self.loadSystem(doc, buildDOFInfo=True)
 
         # look for unconstrained objects and label them
         solverObjectNames = []
@@ -447,35 +678,47 @@ class SolverSystem():
                     doc.getObject(rig.objectName)
                     )
 
-    def solveAccuracySteps(self,doc, matelist=None):
-        self.level_of_accuracy=1
-        self.mySOLVER_POS_ACCURACY = self.getSolverControlData()[self.level_of_accuracy][0]
-        self.mySOLVER_SPIN_ACCURACY = self.getSolverControlData()[self.level_of_accuracy][1]
+    def _prepareAccuracyLoop(self):
+        solverControlData = self.getSolverControlData()
+        self.level_of_accuracy = 1
+        self.mySOLVER_POS_ACCURACY = solverControlData[self.level_of_accuracy][0]
+        self.mySOLVER_SPIN_ACCURACY = solverControlData[self.level_of_accuracy][1]
+        self.lastPositionError = SOLVER_CONVERGENCY_ERROR_INIT_VALUE
+        self.lastAxisError = SOLVER_CONVERGENCY_ERROR_INIT_VALUE
+        self.convergencyCounter = 0
+        self.maxAxisError = 0.0
+        self.maxSingleAxisError = 0.0
+        self.maxPosError = 0.0
+        self.timingChainMs = 0.0
+        self.unmovedParts = []
+        for rig in self.rigids:
+            rig.moved = False
+        return solverControlData
 
-        self.loadSystem(doc, matelist)
-        if self.status == "loadingDependencyError":
-            return
-        self.assignParentship(doc)
+    def _runAccuracyLoop(self, doc, solverControlData):
         while True:
+            self.prepareRestart()
+            tChain0 = time.perf_counter()
             systemSolved = self.calculateChain(doc)
+            self.timingChainMs += (time.perf_counter() - tChain0) * 1000.0
             if self.level_of_accuracy == 1:
-                self.detectUnmovedParts()   # do only once here. It can fail at higher accuracy levels
-                                            # where not a final solution is required.
+                self.detectUnmovedParts()
             if a2plib.SOLVER_ONESTEP > 0:
                 systemSolved = True
                 break
             if systemSolved:
-                self.level_of_accuracy+=1
-                if self.level_of_accuracy > len(self.getSolverControlData()):
+                self.level_of_accuracy += 1
+                if self.level_of_accuracy > len(solverControlData):
                     self.solutionToParts(doc)
                     break
-                self.mySOLVER_POS_ACCURACY = self.getSolverControlData()[self.level_of_accuracy][0]
-                self.mySOLVER_SPIN_ACCURACY = self.getSolverControlData()[self.level_of_accuracy][1]
-                self.loadSystem(doc, matelist)
+                self.mySOLVER_POS_ACCURACY = solverControlData[self.level_of_accuracy][0]
+                self.mySOLVER_SPIN_ACCURACY = solverControlData[self.level_of_accuracy][1]
             else:
-                completeSolvingRequired = self.getSolverControlData()[self.level_of_accuracy][2]
-                if not completeSolvingRequired: systemSolved = True
+                completeSolvingRequired = solverControlData[self.level_of_accuracy][2]
+                if not completeSolvingRequired:
+                    systemSolved = True
                 break
+
         self.maxAxisError = 0.0
         self.maxSingleAxisError = 0.0
         self.maxPosError = 0.0
@@ -492,14 +735,26 @@ class SolverSystem():
             Msg(translate("A2plus", "TARGET  SPIN-ACCURACY :{}").format(self.mySOLVER_SPIN_ACCURACY) + "\n")
             Msg(translate("A2plus", "REACHED SPIN-ACCURACY :{}").format(self.maxAxisError) + "\n")
             Msg(translate("A2plus", "SA      SPIN-ACCURACY :{}").format(self.maxSingleAxisError) + "\n")
-
         return systemSolved
 
-    def solveSystem(self,doc,matelist=None, showFailMessage=True):
+    def solveAccuracySteps(self,doc, matelist=None, checkFaultyConstraints=True):
+        solverControlData = self._prepareAccuracyLoop()
+        tLoad0 = time.perf_counter()
+        self.loadSystem(doc, matelist, checkFaultyConstraints, buildDOFInfo=False)
+        self.timingLoadMs = (time.perf_counter() - tLoad0) * 1000.0
+        if self.status == "loadingDependencyError":
+            return
+        return self._runAccuracyLoop(doc, solverControlData)
+
+    def solveAccuracyStepsLoaded(self, doc):
+        solverControlData = self._prepareAccuracyLoop()
+        return self._runAccuracyLoop(doc, solverControlData)
+
+    def solveSystem(self,doc,matelist=None, showFailMessage=True, checkFaultyConstraints=True):
         if not a2plib.SIMULATION_STATE:
             Msg("===== " + translate("A2plus", "Start Solving System") + " =====\n")
 
-        systemSolved = self.solveAccuracySteps(doc,matelist)
+        systemSolved = self.solveAccuracySteps(doc, matelist, checkFaultyConstraints)
         if self.status == "loadingDependencyError":
             return systemSolved
         if systemSolved:
@@ -529,6 +784,45 @@ Please run the conflict finder tool!
                         msg
                         )
                 return systemSolved
+
+    def solveSystemLoaded(self, doc, showFailMessage=True, syncBefore=True):
+        if not a2plib.SIMULATION_STATE:
+            Msg("===== " + translate("A2plus", "Start Solving System") + " =====\n")
+
+        if syncBefore:
+            tSync0 = time.perf_counter()
+            if not self.syncFromDocument(doc):
+                self.status = "sessionInvalid"
+                return False
+            self.timingLoadMs = (time.perf_counter() - tSync0) * 1000.0
+
+        systemSolved = self.solveAccuracyStepsLoaded(doc)
+        if systemSolved:
+            self.status = "solved"
+            if not a2plib.SIMULATION_STATE:
+                Msg("===== " + translate("A2plus", "System solved using partial + recursive unfixing") + " =====\n")
+                self.checkForUnmovedParts()
+        else:
+            if a2plib.SIMULATION_STATE:
+                self.status = "unsolved"
+                return systemSolved
+
+            self.status = "unsolved"
+            if showFailMessage:
+                Msg("===== " + translate("A2plus", "Could not solve system") + " =====\n")
+                msg = \
+translate("A2plus",
+'''
+Constraints inconsistent. Cannot solve System.
+Please run the conflict finder tool!
+'''
+)
+                QtGui.QMessageBox.information(
+                    QtGui.QApplication.activeWindow(),
+                    translate("A2plus", "Constraint mismatch"),
+                    msg
+                    )
+        return systemSolved
 
     def checkForUnmovedParts(self):
         """
@@ -568,15 +862,21 @@ to a fixed part!
         # Initialize step count and work list
         self.stepCount = 0
         workList = []
+        workListSet = set()
 
-        if a2plib.SIMULATION_STATE or not a2plib.PARTIAL_PROCESSING_ENABLED:
-            # Solve complete system at once if simulation is running or partial processing is disabled
+        if not a2plib.PARTIAL_PROCESSING_ENABLED:
+            # Solve complete system at once if partial processing is disabled
             workList = self.rigids
             return self.calculateWorkList(doc, workList)
 
-        # Normal partial solving if no simulation is running and partial processing is enabled
+        # Normal partial solving when partial processing is enabled
         # Load initial worklist with all fixed parts
         workList.extend(rig for rig in self.rigids if rig.fixed)
+        workListSet = set(workList)
+
+        if len(workList) == 0:
+            workList = self.rigids
+            return self.calculateWorkList(doc, workList)
 
         while True:
             addList = set()
@@ -585,7 +885,7 @@ to a fixed part!
             # Check linked rigids for possible additions to the work list
             for rig in workList:
                 for linkedRig in rig.linkedRigids:
-                    if linkedRig not in workList and rig.isFullyConstrainedByRigid(linkedRig):
+                    if linkedRig not in workListSet and rig.isFullyConstrainedByRigid(linkedRig):
                         addList.add(linkedRig)
                         newRigFound = True
                         break
@@ -600,6 +900,7 @@ to a fixed part!
                 for rig in addList:
                     rig.updateCachedState(rig.placement)
                 workList.extend(addList)
+                workListSet.update(addList)
                 solutionFound = self.calculateWorkList(doc, workList)
                 if not solutionFound:
                     return False
@@ -615,8 +916,9 @@ to a fixed part!
         reqPosAccuracy = self.mySOLVER_POS_ACCURACY
         reqSpinAccuracy = self.mySOLVER_SPIN_ACCURACY
 
+        workListSet = set(workList)
         for rig in workList:
-            rig.enableDependencies(workList)
+            rig.enableDependencies(workList, workListSet)
         for rig in workList:
             rig.calcSpinBasicDataDepsEnabled()
 
@@ -624,22 +926,23 @@ to a fixed part!
         self.lastAxisError = SOLVER_CONVERGENCY_ERROR_INIT_VALUE
         self.convergencyCounter = 0
 
-        calcCount = 0
         goodAccuracy = False
-        pos_error_check=True
-        maxAxisError_check=True
-        maxSingleAxisError_check=True
-        pos_error_save=[]
-        axis_error_save=[]
-        single_axis_error_save=[]
         while not goodAccuracy:
+            # Check for async cancellation
+            if self._asyncCancelCheck is not None and self._asyncCancelCheck():
+                return False
+            
             maxPosError = 0.0
             maxAxisError = 0.0
             maxSingleAxisError = 0.0
 
-            calcCount += 1
             self.stepCount += 1
             self.convergencyCounter += 1
+            
+            # Emit progress every 100 steps (if async)
+            if self._asyncProgressCallback is not None and self.stepCount % 100 == 0:
+                self._asyncProgressCallback(self.stepCount, maxPosError)
+            
             # First calculate all the movement vectors
             for w in workList:
                 w.moved = True
@@ -669,10 +972,10 @@ to a fixed part!
                     r.applySolution(doc, self)
                     r.tempfixed = True
 
-            if self.convergencyCounter > SOLVER_STEPS_CONVERGENCY_CHECK:
+            if self.convergencyCounter > self.convergencyCheckSteps:
                 if (
-                    maxPosError  >= SOLVER_CONVERGENCY_FACTOR * self.lastPositionError or
-                    maxAxisError >= SOLVER_CONVERGENCY_FACTOR * self.lastAxisError
+                    maxPosError  >= self.convergencyFactor * self.lastPositionError or
+                    maxAxisError >= self.convergencyFactor * self.lastAxisError
                     ):
                     foundRigidToUnfix = False
                     # search for unsolved dependencies...
@@ -702,8 +1005,8 @@ to a fixed part!
                 self.maxSingleAxisError = maxSingleAxisError
                 self.convergencyCounter = 0
 
-            if self.stepCount > SOLVER_MAXSTEPS:
-                Msg(translate("A2plus", "Reached max calculations count: {}").format(SOLVER_MAXSTEPS) + "\n")
+            if self.stepCount > self.maxSteps:
+                Msg(translate("A2plus", "Reached max calculations count: {}").format(self.maxSteps) + "\n")
                 return False
         return True
 
@@ -712,7 +1015,252 @@ to a fixed part!
             rig.applySolution(doc, self);
 
 #------------------------------------------------------------------------------
-def solveConstraints( doc, cache=None, useTransaction = True, matelist=None, showFailMessage=True):
+_SOLVER_SESSIONS = {}
+
+def _constraintValueToFloat(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except:
+        pass
+    try:
+        return float(value.Value)
+    except:
+        return None
+
+class SolverSession(object):
+    def __init__(self, doc):
+        self.doc = doc
+        self.constraintEntryByName = {}
+        self.activeConstraints = []
+        self.activeConstraintByName = {}
+        self.constraintsByObject = {}
+        self.solverCache = {}
+        # Session-level geometry cache - persists across multiple solves
+        # Keys: 'objects', 'pos', 'axis', 'face', 'edge'
+        # This dramatically speeds up repeated solves (e.g., during drag)
+        self.geometryCache = {}
+
+    def invalidate(self):
+        for solver in self.solverCache.values():
+            solver.clear()
+        self.solverCache = {}
+        self.geometryCache = {}  # Clear geometry cache on invalidation
+
+    def _normalizeChangedConstraints(self, changedConstraints):
+        if changedConstraints is None:
+            return None
+        if isinstance(changedConstraints, (list, tuple, set)):
+            return [c for c in changedConstraints if c is not None]
+        return [changedConstraints]
+
+    def refreshConstraintCacheChanged(self, changedConstraints):
+        changedList = self._normalizeChangedConstraints(changedConstraints)
+        if changedList is None:
+            return False
+        if len(changedList) == 0:
+            return len(self.activeConstraints) > 0
+        if len(self.activeConstraints) == 0:
+            return False
+
+        changed = False
+        for c in changedList:
+            cName = getattr(c, 'Name', None)
+            if cName is None:
+                return False
+            cInDoc = self.doc.getObject(cName)
+            if cInDoc is None:
+                return False
+            c = cInDoc
+            if cName not in self.activeConstraintByName:
+                return False
+            if hasattr(c, 'Suppressed') and c.Suppressed:
+                return False
+
+            oldEntry = self.constraintEntryByName.get(cName)
+            newEntry = self._constraintSignatureEntry(c)
+            if oldEntry is None:
+                return False
+
+            if newEntry[:6] != oldEntry[:6]:
+                return False
+
+            if newEntry != oldEntry:
+                self.constraintEntryByName[cName] = newEntry
+                self.activeConstraintByName[cName] = c
+                changed = True
+
+        if changed:
+            self.invalidate()
+        return True
+
+    def _constraintSignatureEntry(self, c):
+        obj1 = getattr(c, 'Object1', None)
+        obj2 = getattr(c, 'Object2', None)
+        return (
+            c.Name,
+            getattr(c, 'Type', None),
+            obj1,
+            getattr(c, 'SubElement1', None),
+            obj2,
+            getattr(c, 'SubElement2', None),
+            getattr(c, 'directionConstraint', None),
+            _constraintValueToFloat(getattr(c, 'offset', None)),
+            _constraintValueToFloat(getattr(c, 'angle', None)),
+            bool(getattr(c, 'lockRotation', False)),
+            )
+
+    def refreshConstraintCache(self):
+        allConstraints = []
+        constraintsByObject = {}
+        signatureChanged = False
+        oldEntries = self.constraintEntryByName
+        newEntries = {}
+
+        for obj in self.doc.Objects:
+            if 'ConstraintInfo' not in getattr(obj, 'Content', ''):
+                continue
+            if hasattr(obj, 'Suppressed') and obj.Suppressed:
+                continue
+            allConstraints.append(obj)
+            for attr in ('Object1', 'Object2'):
+                objectName = getattr(obj, attr, None)
+                if objectName is None:
+                    continue
+                constraintsByObject.setdefault(objectName, []).append(obj)
+            entry = self._constraintSignatureEntry(obj)
+            newEntries[obj.Name] = entry
+            if oldEntries.get(obj.Name) != entry:
+                signatureChanged = True
+
+        if not signatureChanged and len(oldEntries) != len(newEntries):
+            signatureChanged = True
+
+        self.activeConstraints = allConstraints
+        self.activeConstraintByName = {c.Name: c for c in allConstraints}
+        self.constraintsByObject = constraintsByObject
+        self.constraintEntryByName = newEntries
+
+        if signatureChanged:
+            self.invalidate()
+
+    def getConstraintGraph(self):
+        self.refreshConstraintCache()
+        return self.activeConstraints, self.constraintsByObject
+
+    def _normalizeMateList(self, matelist):
+        if matelist is None:
+            return list(self.activeConstraints)
+
+        constraints = []
+        names = set()
+        for c in matelist:
+            if c is None:
+                continue
+            cName = getattr(c, 'Name', None)
+            if cName is None or cName in names:
+                continue
+            activeConstraint = self.activeConstraintByName.get(cName)
+            if activeConstraint is None:
+                continue
+            names.add(cName)
+            constraints.append(activeConstraint)
+        return constraints
+
+    def _scopeKey(self, constraints):
+        return tuple(sorted(c.Name for c in constraints))
+
+    def getSolver(self, matelist, fastMode, checkFaultyConstraints, changedConstraints=None, skipConstraintRefresh=False):
+        if skipConstraintRefresh and len(self.activeConstraints) > 0:
+            pass
+        elif not self.refreshConstraintCacheChanged(changedConstraints):
+            self.refreshConstraintCache()
+
+        scopeConstraints = self._normalizeMateList(matelist)
+        scopeKey = self._scopeKey(scopeConstraints)
+        cacheKey = (scopeKey, bool(fastMode), bool(checkFaultyConstraints))
+        cachedSolver = self.solverCache.get(cacheKey)
+        if cachedSolver is not None:
+            tSync0 = time.perf_counter()
+            if cachedSolver.syncFromDocument(self.doc):
+                cachedSolver.timingLoadMs = (time.perf_counter() - tSync0) * 1000.0
+                return cachedSolver, True
+            self.solverCache.pop(cacheKey, None)
+
+        solver = SolverSystem()
+        solver.configureMode(fastMode)
+        tLoad0 = time.perf_counter()
+        solver.loadSystem(
+            self.doc,
+            scopeConstraints,
+            checkFaultyConstraints=checkFaultyConstraints,
+            buildDOFInfo=False,
+            geometryCache=self.geometryCache  # Pass session-level geometry cache
+            )
+        solver.timingLoadMs = (time.perf_counter() - tLoad0) * 1000.0
+        if solver.status != "loadingDependencyError":
+            self.solverCache[cacheKey] = solver
+        return solver, False
+
+def _getSolverSession(doc):
+    if doc is None:
+        return None
+    key = doc.Name
+    session = _SOLVER_SESSIONS.get(key)
+    if session is None or session.doc is not doc:
+        session = SolverSession(doc)
+        _SOLVER_SESSIONS[key] = session
+    return session
+
+def clearSolverSession(doc=None):
+    if doc is None:
+        for session in _SOLVER_SESSIONS.values():
+            session.invalidate()
+        _SOLVER_SESSIONS.clear()
+        return
+    key = doc.Name
+    session = _SOLVER_SESSIONS.pop(key, None)
+    if session is not None:
+        session.invalidate()
+
+def _sessionOptionsFromCache(cache):
+    changedConstraints = None
+    skipConstraintRefresh = False
+    if isinstance(cache, dict):
+        changedConstraints = cache.get('changedConstraints', None)
+        skipConstraintRefresh = bool(cache.get('skipConstraintRefresh', False))
+    return changedConstraints, skipConstraintRefresh
+
+def _solveWithSession(
+    session,
+    doc,
+    matelist,
+    fastMode,
+    showFailMessage,
+    checkFaultyConstraints,
+    changedConstraints=None,
+    skipConstraintRefresh=False
+    ):
+    solver, isSynced = session.getSolver(
+        matelist,
+        fastMode,
+        checkFaultyConstraints,
+        changedConstraints=changedConstraints,
+        skipConstraintRefresh=skipConstraintRefresh
+        )
+    if solver.status == "loadingDependencyError":
+        return False, solver
+    return solver.solveSystemLoaded(doc, showFailMessage=showFailMessage, syncBefore=not isSynced), solver
+
+def solveConstraints(
+    doc,
+    cache=None,
+    useTransaction=True,
+    matelist=None,
+    showFailMessage=True,
+    compatibilityFallback=True
+    ):
 
     if doc is None:
         QtGui.QMessageBox.information(
@@ -722,12 +1270,187 @@ def solveConstraints( doc, cache=None, useTransaction = True, matelist=None, sho
                     )
         return
 
-    if useTransaction: doc.openTransaction("a2p_systemSolving")
-    ss = SolverSystem()
-    systemSolved = ss.solveSystem(doc, matelist, showFailMessage )
-    if useTransaction: doc.commitTransaction()
-    a2plib.unTouchA2pObjects()
+    if useTransaction:
+        doc.openTransaction("a2p_systemSolving")
+    t0 = time.perf_counter()
+
+    changedConstraints, skipConstraintRefresh = _sessionOptionsFromCache(cache)
+
+    session = _getSolverSession(doc)
+    systemSolved, usedSolver = _solveWithSession(
+        session,
+        doc,
+        matelist,
+        fastMode=True,
+        showFailMessage=False,
+        checkFaultyConstraints=False,
+        changedConstraints=changedConstraints,
+        skipConstraintRefresh=skipConstraintRefresh
+        )
+
+    if compatibilityFallback and not systemSolved and not a2plib.SIMULATION_STATE:
+        Msg(translate("A2plus", "Aggressive solve did not converge, retrying in compatibility mode") + "\n")
+        systemSolved, usedSolver = _solveWithSession(
+            session,
+            doc,
+            matelist,
+            fastMode=False,
+            showFailMessage=showFailMessage,
+            checkFaultyConstraints=True,
+            changedConstraints=changedConstraints,
+            skipConstraintRefresh=skipConstraintRefresh
+            )
+
+    if useTransaction:
+        doc.commitTransaction()
+
+    touchedObjects = [doc.getObject(name) for name in usedSolver.touchedObjectNames]
+    a2plib.unTouchA2pObjects(touchedObjects)
+
+    if not a2plib.SIMULATION_STATE:
+        dt = (time.perf_counter() - t0) * 1000.0
+        Msg(translate("A2plus", "Solver runtime: {:.1f} ms").format(dt) + "\n")
+        Msg(translate("A2plus", "  load: {:.1f} ms, chain: {:.1f} ms").format(
+            usedSolver.timingLoadMs,
+            usedSolver.timingChainMs
+            ) + "\n")
     return systemSolved
+
+def _collectActiveConstraints(doc):
+    session = _getSolverSession(doc)
+    if session is None:
+        return [], {}
+    return session.getConstraintGraph()
+
+def _walkConstraintComponent(allConstraints, constraintsByObject, seedObjects):
+    if len(allConstraints) == 0 or len(seedObjects) == 0:
+        return None
+
+    visitedObjects = set()
+    visitedConstraints = set()
+    pendingObjects = list(seedObjects)
+
+    while len(pendingObjects) > 0:
+        objectName = pendingObjects.pop()
+        if objectName in visitedObjects:
+            continue
+        visitedObjects.add(objectName)
+        for c in constraintsByObject.get(objectName, []):
+            if c.Name in visitedConstraints:
+                continue
+            visitedConstraints.add(c.Name)
+            obj1 = getattr(c, 'Object1', None)
+            obj2 = getattr(c, 'Object2', None)
+            if obj1 is not None and obj1 not in visitedObjects:
+                pendingObjects.append(obj1)
+            if obj2 is not None and obj2 not in visitedObjects:
+                pendingObjects.append(obj2)
+
+    if len(visitedConstraints) == 0:
+        return None
+
+    return [c for c in allConstraints if c.Name in visitedConstraints]
+
+def getConstraintComponent(doc, changedConstraints):
+    if doc is None or changedConstraints is None:
+        return None
+
+    if isinstance(changedConstraints, (list, tuple, set)):
+        seedConstraints = list(changedConstraints)
+    else:
+        seedConstraints = [changedConstraints]
+
+    allConstraints, constraintsByObject = _collectActiveConstraints(doc)
+
+    seedObjects = []
+    for c in seedConstraints:
+        if c is None:
+            continue
+        if 'ConstraintInfo' not in getattr(c, 'Content', ''):
+            continue
+        for attr in ('Object1', 'Object2'):
+            objectName = getattr(c, attr, None)
+            if objectName is not None:
+                seedObjects.append(objectName)
+
+    if len(seedObjects) == 0:
+        return None
+
+    return _walkConstraintComponent(allConstraints, constraintsByObject, seedObjects)
+
+def getConstraintComponentByObjects(doc, changedObjects):
+    if doc is None or changedObjects is None:
+        return None
+
+    if isinstance(changedObjects, (list, tuple, set)):
+        seedObjects = [name for name in changedObjects if name is not None]
+    else:
+        seedObjects = [changedObjects]
+
+    if len(seedObjects) == 0:
+        return None
+
+    allConstraints, constraintsByObject = _collectActiveConstraints(doc)
+    return _walkConstraintComponent(allConstraints, constraintsByObject, seedObjects)
+
+def solveConstraintsIncremental(
+    doc,
+    changedConstraints,
+    cache=None,
+    useTransaction=True,
+    showFailMessage=True,
+    compatibilityFallback=True
+    ):
+    matelist = getConstraintComponent(doc, changedConstraints)
+    if matelist is None:
+        return solveConstraints(
+            doc,
+            cache=cache,
+            useTransaction=useTransaction,
+            showFailMessage=showFailMessage,
+            compatibilityFallback=compatibilityFallback
+            )
+
+    if not a2plib.SIMULATION_STATE:
+        touchedObjects = set()
+        for c in matelist:
+            obj1 = getattr(c, 'Object1', None)
+            obj2 = getattr(c, 'Object2', None)
+            if obj1 is not None:
+                touchedObjects.add(obj1)
+            if obj2 is not None:
+                touchedObjects.add(obj2)
+        Msg(translate("A2plus", "Incremental solve: {} constraints, {} objects").format(
+            len(matelist),
+            len(touchedObjects)
+            ) + "\n")
+
+    solved = solveConstraints(
+        doc,
+        cache=cache,
+        useTransaction=useTransaction,
+        matelist=matelist,
+        showFailMessage=False,
+        compatibilityFallback=compatibilityFallback
+        )
+
+    if solved:
+        return True
+
+    if not compatibilityFallback:
+        return False
+
+    if not a2plib.SIMULATION_STATE:
+        Msg(translate("A2plus", "Incremental solve failed, retrying full solve") + "\n")
+
+    return solveConstraints(
+        doc,
+        cache=cache,
+        useTransaction=useTransaction,
+        matelist=None,
+        showFailMessage=showFailMessage,
+        compatibilityFallback=compatibilityFallback
+        )
 
 def autoSolveConstraints( doc, callingFuncName, cache=None, useTransaction=True, matelist=None):
     if not a2plib.getAutoSolveState():
@@ -740,7 +1463,7 @@ def autoSolveConstraints( doc, callingFuncName, cache=None, useTransaction=True,
                 )
                )
         """
-    solveConstraints(doc, useTransaction)
+    solveConstraints(doc, cache=cache, useTransaction=useTransaction, matelist=matelist)
 
 class a2p_SolverCommand:
     def Activated(self):

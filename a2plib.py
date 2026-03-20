@@ -25,6 +25,7 @@
 
 import os
 import sys
+import time
 import FreeCAD
 import FreeCADGui
 from FreeCAD import Base
@@ -55,6 +56,10 @@ SHOW_WARNING_FLOATING_PARTS = True
 SIMULATION_STATE = False
 
 SAVED_TRANSPARENCY = []
+_SELECTION_EX_CACHE_TIME = 0.0
+_SELECTION_EX_CACHE_VALUE = None
+_SELECTION_CLASSIFY_CACHE = {}
+_SELECTION_CLASSIFY_CACHE_LIMIT = 512
 
 
 path_a2p = os.path.dirname(__file__)
@@ -460,6 +465,38 @@ def getSelectedConstraint():
 
     return connectionToView
 #------------------------------------------------------------------------------
+def getSelectionExCached(maxAge=0.05):
+    global _SELECTION_EX_CACHE_TIME
+    global _SELECTION_EX_CACHE_VALUE
+    now = time.monotonic()
+    if _SELECTION_EX_CACHE_VALUE is not None and (now - _SELECTION_EX_CACHE_TIME) <= maxAge:
+        return _SELECTION_EX_CACHE_VALUE
+    _SELECTION_EX_CACHE_VALUE = FreeCADGui.Selection.getSelectionEx()
+    _SELECTION_EX_CACHE_TIME = now
+    return _SELECTION_EX_CACHE_VALUE
+
+#------------------------------------------------------------------------------
+def _selectionCacheKey(selection):
+    if len(selection.SubElementNames) == 0:
+        return (selection.ObjectName, "")
+    return (selection.ObjectName, selection.SubElementNames[0])
+
+#------------------------------------------------------------------------------
+def _selectionClassifyCached(selection, classifierName, classifier):
+    global _SELECTION_CLASSIFY_CACHE
+    key = _selectionCacheKey(selection)
+    classCache = _SELECTION_CLASSIFY_CACHE.get(key)
+    if classCache is None:
+        if len(_SELECTION_CLASSIFY_CACHE) > _SELECTION_CLASSIFY_CACHE_LIMIT:
+            _SELECTION_CLASSIFY_CACHE = {}
+        classCache = {}
+        _SELECTION_CLASSIFY_CACHE[key] = classCache
+    if classifierName in classCache:
+        return classCache[classifierName]
+    result = classifier(selection)
+    classCache[classifierName] = result
+    return result
+#------------------------------------------------------------------------------
 def appVersionStr():
     version = int(FreeCAD.Version()[0])
     subVersion = int(float(FreeCAD.Version()[1]))
@@ -803,56 +840,61 @@ def getObjectEdgeFromName( obj, name ):
     return obj.Shape.Edges[ind]
 #------------------------------------------------------------------------------
 def CircularEdgeSelected( selection ):
-    if len( selection.SubElementNames ) == 1:
-        subElement = selection.SubElementNames[0]
-        if subElement.startswith('Edge'):
-            edge = getObjectEdgeFromName( selection.Object, subElement)
-            if not hasattr(edge, 'Curve'): #issue 39
-                return False
-            if isLine(edge.Curve):
-                return False
-            if hasattr( edge.Curve, 'Radius' ):
-                return True
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            subElement = sel.SubElementNames[0]
+            if subElement.startswith('Edge'):
+                edge = getObjectEdgeFromName( sel.Object, subElement)
+                if not hasattr(edge, 'Curve'): #issue 39
+                    return False
+                if isLine(edge.Curve):
+                    return False
+                if hasattr( edge.Curve, 'Radius' ):
+                    return True
 
-            # the following section fails for linear edges, protect it
-            # by try/except block
-            try:
-                BSpline = edge.Curve.toBSpline()
-                arcs = BSpline.toBiArcs(10**-6)
-                if all( hasattr(a,'Center') for a in arcs ):
-                    centers = numpy.array([a.Center for a in arcs])
-                    sigma = numpy.std( centers, axis=0 )
-                    if max(sigma) < 10**-6: #then circular curve
-                        return True
-            except:
-                pass
-
-    return False
+                # the following section fails for linear edges, protect it
+                # by try/except block
+                try:
+                    BSpline = edge.Curve.toBSpline()
+                    arcs = BSpline.toBiArcs(10**-6)
+                    if all( hasattr(a,'Center') for a in arcs ):
+                        centers = numpy.array([a.Center for a in arcs])
+                        sigma = numpy.std( centers, axis=0 )
+                        if max(sigma) < 10**-6: #then circular curve
+                            return True
+                except:
+                    pass
+        return False
+    return _selectionClassifyCached(selection, "CircularEdgeSelected", classify)
 #------------------------------------------------------------------------------
 def ClosedEdgeSelected( selection ):
-    if len( selection.SubElementNames ) == 1:
-        subElement = selection.SubElementNames[0]
-        if subElement.startswith('Edge'):
-            edge = getObjectEdgeFromName( selection.Object, subElement)
-            if edge.isClosed():
-                return True
-            else:
-                return False
-    return False
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            subElement = sel.SubElementNames[0]
+            if subElement.startswith('Edge'):
+                edge = getObjectEdgeFromName( sel.Object, subElement)
+                if edge.isClosed():
+                    return True
+                else:
+                    return False
+        return False
+    return _selectionClassifyCached(selection, "ClosedEdgeSelected", classify)
 #------------------------------------------------------------------------------
 def AxisOfPlaneSelected( selection ): #adding Planes/Faces selection for Axial constraints
-    if len( selection.SubElementNames ) == 1:
-        subElement = selection.SubElementNames[0]
-        if subElement.startswith('Face'):
-            face = getObjectFaceFromName( selection.Object, subElement)
-            if str(face.Surface) == '<Plane object>':
-                return True
-            else:
-                axis, center, error = fit_rotation_axis_to_surface1(face.Surface)
-                error_normalized = error / face.BoundBox.DiagonalLength
-                if error_normalized < 10**-6:
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            subElement = sel.SubElementNames[0]
+            if subElement.startswith('Face'):
+                face = getObjectFaceFromName( sel.Object, subElement)
+                if str(face.Surface) == '<Plane object>':
                     return True
-    return False
+                else:
+                    axis, center, error = fit_rotation_axis_to_surface1(face.Surface)
+                    error_normalized = error / face.BoundBox.DiagonalLength
+                    if error_normalized < 10**-6:
+                        return True
+        return False
+    return _selectionClassifyCached(selection, "AxisOfPlaneSelected", classify)
 #------------------------------------------------------------------------------
 def printSelection(selection):
     entries = []
@@ -869,65 +911,75 @@ def updateObjectProperties( c ):
     return
 #------------------------------------------------------------------------------
 def planeSelected( selection ):
-    if len( selection.SubElementNames ) == 1:
-        subElement = selection.SubElementNames[0]
-        if subElement.startswith('Face'):
-            face = getObjectFaceFromName( selection.Object, subElement)
-            if str(face.Surface) == '<Plane object>':
-                return True
-            elif str(face.Surface) == '<BSplineSurface object>':
-                normal,pos,error = fit_plane_to_surface1(face.Surface)
-                if abs(error) < 1e-9:
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            subElement = sel.SubElementNames[0]
+            if subElement.startswith('Face'):
+                face = getObjectFaceFromName( sel.Object, subElement)
+                if str(face.Surface) == '<Plane object>':
                     return True
-    return False
+                elif str(face.Surface) == '<BSplineSurface object>':
+                    normal,pos,error = fit_plane_to_surface1(face.Surface)
+                    if abs(error) < 1e-9:
+                        return True
+        return False
+    return _selectionClassifyCached(selection, "planeSelected", classify)
 #------------------------------------------------------------------------------
 def vertexSelected( selection ):
-    if len( selection.SubElementNames ) == 1:
-        return selection.SubElementNames[0].startswith('Vertex')
-    return False
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            return sel.SubElementNames[0].startswith('Vertex')
+        return False
+    return _selectionClassifyCached(selection, "vertexSelected", classify)
 #------------------------------------------------------------------------------
 def cylindricalFaceSelected( selection ):
-    if len( selection.SubElementNames ) == 1:
-        subElement = selection.SubElementNames[0]
-        if subElement.startswith('Face'):
-            face = getObjectFaceFromName( selection.Object, subElement)
-            if hasattr(face.Surface,'Radius'):
-                return True
-            elif str(face.Surface).startswith('<SurfaceOfRevolution'):
-                return True
-            else:
-                axis, center, error = fit_rotation_axis_to_surface1(face.Surface)
-                error_normalized = error / face.BoundBox.DiagonalLength
-                if error_normalized < 10**-6:
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            subElement = sel.SubElementNames[0]
+            if subElement.startswith('Face'):
+                face = getObjectFaceFromName( sel.Object, subElement)
+                if hasattr(face.Surface,'Radius'):
                     return True
-    return False
+                elif str(face.Surface).startswith('<SurfaceOfRevolution'):
+                    return True
+                else:
+                    axis, center, error = fit_rotation_axis_to_surface1(face.Surface)
+                    error_normalized = error / face.BoundBox.DiagonalLength
+                    if error_normalized < 10**-6:
+                        return True
+        return False
+    return _selectionClassifyCached(selection, "cylindricalFaceSelected", classify)
 #------------------------------------------------------------------------------
 def LinearEdgeSelected( selection ):
-    if len( selection.SubElementNames ) == 1:
-        subElement = selection.SubElementNames[0]
-        if subElement.startswith('Edge'):
-            edge = getObjectEdgeFromName( selection.Object, subElement)
-            if not hasattr(edge, 'Curve'): #issue 39
-                return False
-            if isLine(edge.Curve):
-                return True
-
-            BSpline = edge.Curve.toBSpline()
-            arcs = BSpline.toBiArcs(10**-6)
-            if all(isLine(a) for a in arcs):
-                lines = arcs
-                D = numpy.array([L.tangent(0)[0] for L in lines]) #D(irections)
-                if numpy.std( D, axis=0 ).max() < 10**-9: #then linear curve
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            subElement = sel.SubElementNames[0]
+            if subElement.startswith('Edge'):
+                edge = getObjectEdgeFromName( sel.Object, subElement)
+                if not hasattr(edge, 'Curve'): #issue 39
+                    return False
+                if isLine(edge.Curve):
                     return True
-    return False
+
+                BSpline = edge.Curve.toBSpline()
+                arcs = BSpline.toBiArcs(10**-6)
+                if all(isLine(a) for a in arcs):
+                    lines = arcs
+                    D = numpy.array([L.tangent(0)[0] for L in lines]) #D(irections)
+                    if numpy.std( D, axis=0 ).max() < 10**-9: #then linear curve
+                        return True
+        return False
+    return _selectionClassifyCached(selection, "LinearEdgeSelected", classify)
 #------------------------------------------------------------------------------
 def sphericalSurfaceSelected( selection ):
-    if len( selection.SubElementNames ) == 1:
-        subElement = selection.SubElementNames[0]
-        if subElement.startswith('Face'):
-            face = getObjectFaceFromName( selection.Object, subElement)
-            return str( face.Surface ).startswith('Sphere ')
-    return False
+    def classify(sel):
+        if len( sel.SubElementNames ) == 1:
+            subElement = sel.SubElementNames[0]
+            if subElement.startswith('Face'):
+                face = getObjectFaceFromName( sel.Object, subElement)
+                return str( face.Surface ).startswith('Sphere ')
+        return False
+    return _selectionClassifyCached(selection, "sphericalSurfaceSelected", classify)
 #------------------------------------------------------------------------------
 def getObjectVertexFromName( obj, name ):
     assert name.startswith('Vertex')
@@ -948,7 +1000,8 @@ def getPos(obj, subElementName):
         face = getObjectFaceFromName(obj, subElementName)
         surface = face.Surface
         if str(surface) == '<Plane object>':
-            pos = getObjectFaceFromName(obj, subElementName).Faces[0].BoundBox.Center
+            # Reuse 'face' instead of calling getObjectFaceFromName again
+            pos = face.Faces[0].BoundBox.Center
             # axial constraint for Planes
             # pos = surface.Position
         elif str(surface) == "<Cylinder object>":
@@ -956,17 +1009,20 @@ def getPos(obj, subElementName):
         elif all( hasattr(surface,a) for a in ['Axis','Center','Radius'] ):
             pos = surface.Center
         elif str(surface).startswith('<SurfaceOfRevolution'):
-            pos = getObjectFaceFromName(obj, subElementName).Edges[0].Curve.Center
+            # Reuse 'face' instead of calling getObjectFaceFromName again
+            pos = face.Edges[0].Curve.Center
         elif str(surface).startswith('<BSplineSurface'):
             axis,pos1,error = fit_plane_to_surface1(surface)
             error_normalized = error / face.BoundBox.DiagonalLength
             if error_normalized < 10**-6: #then good plane fit
                 pos = pos1
-            axis, center, error = fit_rotation_axis_to_surface1(face.Surface)
-            if axis is not None:
-                error_normalized = error / face.BoundBox.DiagonalLength
-                if error_normalized < 10**-6: #then good rotation_axis fix
-                    pos = center
+            # Only call fit_rotation_axis if plane fit didn't work
+            if pos is None:
+                axis, center, error = fit_rotation_axis_to_surface1(face.Surface)
+                if axis is not None:
+                    error_normalized = error / face.BoundBox.DiagonalLength
+                    if error_normalized < 10**-6: #then good rotation_axis fix
+                        pos = center
 
     elif subElementName.startswith('Edge'):
         edge = getObjectEdgeFromName(obj, subElementName)
@@ -1047,9 +1103,17 @@ def getAxis(obj, subElementName):
 
     return axis # may be none!
 #------------------------------------------------------------------------------
-def unTouchA2pObjects():
+def unTouchA2pObjects(objects=None):
     doc = FreeCAD.activeDocument()
-    for obj in doc.Objects:
+    if doc is None:
+        return
+    if objects is None:
+        iterable = doc.Objects
+    else:
+        iterable = objects
+    for obj in iterable:
+        if obj is None:
+            continue
         # leave A2pSketches touched (for recomputing dependent shapes)
         if isA2pSketch(obj): continue
         if isA2pObject(obj):

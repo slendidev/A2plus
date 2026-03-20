@@ -24,6 +24,7 @@
 
 import os
 import sys
+import time
 import FreeCAD, FreeCADGui
 from PySide import QtGui, QtCore
 import copy
@@ -872,6 +873,7 @@ def updateImportedParts(doc, partial=False):
     if sub is not None:
         sub.showMaximized()
     objectCache.cleanUp(doc)
+    a2p_solversystem.clearSolverSession(doc)
     a2p_solversystem.autoSolveConstraints(
         doc,
         useTransaction = False,
@@ -1239,17 +1241,23 @@ FreeCADGui.addCommand('a2p_movePart', a2p_MovePartCommand())
 class ConstrainedPartsMover:
     def __init__(self, view):
         self.obj = None
+        self.solveMates = None
         self.view = view
         self.doc = FreeCAD.activeDocument()
         self.callbackMove = self.view.addEventCallback("SoLocation2Event",self.onMouseMove)
         self.callbackClick = self.view.addEventCallback("SoMouseButtonEvent",self.onMouseClicked)
         self.callbackKey = self.view.addEventCallback("SoKeyboardEvent",self.KeyboardEvent)
         self.motionActivated = False
+        self.lastSolveTime = 0.0
+        self.solveIntervalSec = 0.05
+        self.asyncSolver = a2p_solversystem.getAsyncSolver()
+        self.pendingSolve = False
 
     def setPreselection(self,doc,obj,sub):
         if not self.motionActivated:
             doc = FreeCAD.activeDocument()
             self.obj = doc.getObject(obj)
+            self.solveMates = None
 
     def addSelection(self,doc,obj,sub,pnt):
         pass
@@ -1265,10 +1273,27 @@ class ConstrainedPartsMover:
         if self.motionActivated:
             newPos = self.view.getPoint( *info['Position'] )
             self.obj.Placement.Base = newPos
-            a2plib.setSimulationState(True)
-            systemSolved = a2p_solversystem.solveConstraints(self.doc, useTransaction = False)
-            a2plib.setSimulationState(False)
-            if systemSolved == False:
+
+            now = time.monotonic()
+            if now - self.lastSolveTime < self.solveIntervalSec:
+                return
+            self.lastSolveTime = now
+
+            if self.solveMates is None:
+                return
+            
+            # Skip if already solving (async solver busy)
+            if self.asyncSolver.isBusy():
+                self.pendingSolve = True
+                return
+            
+            self._startAsyncSolve()
+    
+    def _startAsyncSolve(self):
+        self.pendingSolve = False
+        
+        def onSolveComplete(success, solver):
+            if not success and self.motionActivated:
                 self.doc.commitTransaction()
                 QtGui.QMessageBox.information(
                     QtGui.QApplication.activeWindow(),
@@ -1276,8 +1301,26 @@ class ConstrainedPartsMover:
                    translate("A2plus", "Use system undo if necessary.")
                    )
                 self.removeCallbacks()
+                return
+            
+            # If another solve was requested while we were busy, start it now
+            if self.pendingSolve and self.motionActivated:
+                self._startAsyncSolve()
+        
+        self.asyncSolver.solveAsync(
+            self.doc,
+            callback=onSolveComplete,
+            matelist=self.solveMates,
+            fastMode=True,
+            cache={'skipConstraintRefresh': True}
+        )
 
     def removeCallbacks(self):
+        a2plib.setSimulationState(False)
+        self.solveMates = None
+        self.pendingSolve = False
+        if self.asyncSolver is not None:
+            self.asyncSolver.cancel()
         self.view.removeEventCallback("SoLocation2Event",self.callbackMove)
         self.view.removeEventCallback("SoMouseButtonEvent",self.callbackClick)
         self.view.removeEventCallback("SoKeyboardEvent",self.callbackKey)
@@ -1298,10 +1341,23 @@ class ConstrainedPartsMover:
                 self.motionActivated = not self.motionActivated
                 if self.motionActivated == True:
                     self.doc.openTransaction("drag constrained parts")
+                    a2plib.setSimulationState(True)
+                    self.solveMates = a2p_solversystem.getConstraintComponentByObjects(self.doc, [self.obj.Name])
                 if self.motionActivated == False:
+                    # Cancel any pending async solve before final high-accuracy solve
+                    self.pendingSolve = False
+                    if self.asyncSolver is not None:
+                        self.asyncSolver.cancel()
                     # Solve last time with high accuracy to finish
                     a2plib.setSimulationState(False)
-                    a2p_solversystem.solveConstraints(self.doc, useTransaction = False)
+                    if self.solveMates is not None:
+                        a2p_solversystem.solveConstraints(
+                            self.doc,
+                            cache={'skipConstraintRefresh': True},
+                            useTransaction=False,
+                            matelist=self.solveMates,
+                            showFailMessage=False
+                            )
                     self.doc.commitTransaction()
                     self.removeCallbacks()
 
